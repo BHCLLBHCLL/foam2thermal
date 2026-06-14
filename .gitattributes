@@ -1,0 +1,5 @@
+*.cgns filter=lfs diff=lfs merge=lfs -text
+tr03.cgns filter=lfs diff=lfs merge=lfs -text
+tr03.gph filter=lfs diff=lfs merge=lfs -text
+laptop_simplified_voxel_less.gph filter=lfs diff=lfs merge=lfs -text
+laptop_simplified_voxel_less_orig.cgns filter=lfs diff=lfs merge=lfs -text

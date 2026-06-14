@@ -1,0 +1,16 @@
+# Python bytecode caches
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Generated CGNS outputs (regenerate via gph2cgns.py)
+box_ansa.cgns
+box.cgns
+
+# Editor / OS junk
+*.swp
+*.swo
+.DS_Store
+
+tests/*
+cases/*

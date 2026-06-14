@@ -1,0 +1,196 @@
+{
+  "_comment": "laptop_thermal_steady_orig_fix 多区域共轭传热配置。cellZone 名来自 `python setup_cht_case.py scan tests/laptop_thermal_steady_orig_fix`",
+
+  "case": {
+    "source": "../tests/laptop_thermal_steady_orig_fix",
+    "output": "../cases/laptop_thermal_cht"
+  },
+
+  "openfoam": {
+    "root": "C:/OF/v2412/msys64/home/ofuser/OpenFOAM/OpenFOAM-v2412",
+    "bash": "C:/OF/v2412/msys64/usr/bin/bash.exe",
+    "solver": "chtMultiRegionSimpleFoam"
+  },
+
+  "regions": [
+    {
+      "name": "air",
+      "type": "fluid",
+      "cellZones": ["laptop_3d_geom.air.air_domain"],
+      "material": "air"
+    },
+    {
+      "name": "case1",
+      "type": "fluid",
+      "cellZones": ["laptop_3d_geom.fan1.case1"],
+      "material": "air"
+    },
+    {
+      "name": "case2",
+      "type": "fluid",
+      "cellZones": ["laptop_3d_geom.fan2.case2"],
+      "material": "air"
+    },
+    {
+      "name": "rot1",
+      "type": "fluid",
+      "cellZones": ["FPHPARTS.rotation1"],
+      "material": "air"
+    },
+    {
+      "name": "rot2",
+      "type": "fluid",
+      "cellZones": ["FPHPARTS.rotation2"],
+      "material": "air"
+    },
+    {
+      "name": "Cu",
+      "type": "solid",
+      "cellZones": ["solid_region.Cu_block"],
+      "material": "aluminum"
+    },
+    {
+      "name": "Cover",
+      "type": "solid",
+      "cellZones": ["solid_region.Cover"],
+      "material": "aluminum"
+    },
+    {
+      "name": "fin1",
+      "type": "solid",
+      "cellZones": ["solid_region.fin_1"],
+      "material": "aluminum"
+    },
+    {
+      "name": "fin2",
+      "type": "solid",
+      "cellZones": ["solid_region.fin_2"],
+      "material": "aluminum"
+    }
+  ],
+
+  "region_materials": {
+    "air": "air",
+    "case1": "air",
+    "case2": "air",
+    "rot1": "air",
+    "rot2": "air",
+    "Cu": "aluminum",
+    "Cover": "aluminum",
+    "fin1": "aluminum",
+    "fin2": "aluminum"
+  },
+
+  "materials": {
+    "air": {
+      "thermoType": {
+        "type": "heRhoThermo",
+        "mixture": "pureMixture",
+        "transport": "const",
+        "thermo": "hConst",
+        "equationOfState": "perfectGas",
+        "specie": "specie",
+        "energy": "sensibleEnthalpy"
+      },
+      "mixture": {
+        "specie": { "nMoles": 1, "molWeight": 28.966 },
+        "thermodynamics": { "Cp": 1006.43, "Hf": 0 },
+        "transport": { "mu": 1.846e-5, "Pr": 0.706 }
+      }
+    },
+    "aluminum": {
+      "thermoType": {
+        "type": "heSolidThermo",
+        "mixture": "pureMixture",
+        "transport": "constIso",
+        "thermo": "hConst",
+        "equationOfState": "rhoConst",
+        "specie": "specie",
+        "energy": "sensibleEnthalpy"
+      },
+      "mixture": {
+        "specie": { "nMoles": 1, "molWeight": 26.98 },
+        "thermodynamics": { "Hf": 0, "Sf": 0, "Cp": 871 },
+        "transport": { "kappa": 202.4 },
+        "equationOfState": { "rho": 2719 }
+      }
+    }
+  },
+
+  "interfaces": {
+    "auto_scan": true,
+    "ami_patterns": ["ami_rot\\d+"],
+    "ami_rotation_axis": [0, 0, 1],
+    "explicit": [
+      { "master": "ami_rot1", "slave": "ami_rot1_1", "method": "cyclicAMI" },
+      { "master": "ami_rot2", "slave": "ami_rot2_1", "method": "cyclicAMI" }
+    ]
+  },
+
+  "patch_regions": {
+    "open": "air",
+    "open_1": "air",
+    "ami_rot1": "rot1",
+    "ami_rot1_1": "rot2",
+    "ami_rot2": "rot1",
+    "ami_rot2_1": "rot2",
+    "case1_s": "case1",
+    "case1_s_1": "air",
+    "case2_s": "case2",
+    "case2_s_1": "air",
+    "CU_s": "Cu",
+    "CU_s_1": "air",
+    "Cover_s": "Cover",
+    "Cover_s_1": "air",
+    "fin1_s": "fin1",
+    "fin1_s_1": "air",
+    "fin2_s": "fin2",
+    "fin2_s_1": "air",
+    "impeller2_s": "rot2",
+    "impeller2_s_1": "air"
+  },
+
+  "initial_conditions": {
+    "T": 300,
+    "U": [0, 0, 0],
+    "p": 101325
+  },
+
+  "boundary_conditions": {
+    "air": {
+      "T": {
+        "open": { "type": "inletOutlet", "inletValue": "uniform 300", "value": "uniform 300" },
+        "open_1": { "type": "inletOutlet", "inletValue": "uniform 300", "value": "uniform 300" }
+      },
+      "U": {
+        "open": { "type": "surfaceNormalFixedValue", "refValue": "uniform -0.5" }
+      }
+    },
+    "Cu": {
+      "T": {
+        "CU_s": {
+          "type": "externalWallHeatFluxTemperature",
+          "mode": "power",
+          "Q": "uniform 15",
+          "kappaMethod": "solidThermo",
+          "value": "uniform 300"
+        }
+      }
+    }
+  },
+
+  "turbulence": { "simulationType": "laminar" },
+  "gravity": [0, 0, -9.81],
+
+  "numerics": {
+    "endTime": 500,
+    "writeInterval": 50,
+    "deltaT": 1,
+    "nNonOrthogonalCorrectors": 0
+  },
+
+  "mesh_prep": {
+    "stitch_interfaces": true,
+    "split_options": ["-cellZonesOnly", "-overwrite"]
+  }
+}
