@@ -5,18 +5,30 @@ from __future__ import annotations
 from typing import Any
 
 
-def foam_header(obj_class: str, obj_name: str, location: str = "") -> str:
-    loc = f'\n    location    "{location}";' if location else ""
-    return f"""/*--------------------------------*- C++ -*----------------------------------*\\
-FoamFile
-{{
-    version     2.0;
-    format      ascii;
-    class       {obj_class};{loc}
-    object      {obj_name};
-}}
-// * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
+_OF_BANNER = """/*--------------------------------*- C++ -*----------------------------------*\\
+| =========                 |                                                 |
+| \\\\      /  F ield         | OpenFOAM: The Open Source CFD Toolbox           |
+|  \\\\    /   O peration     | Version:  v2412                                 |
+|   \\\\  /    A nd           | Website:  www.openfoam.com                      |
+|    \\/     M anipulation  |                                                 |
+\\*---------------------------------------------------------------------------*/
 """
+
+
+def foam_header(obj_class: str, obj_name: str, location: str = "", *, fmt: str = "ascii") -> str:
+    loc = f'\n    location    "{location}";' if location else ""
+    return (
+        _OF_BANNER
+        + "FoamFile\n"
+        + "{\n"
+        + "    version     2.0;\n"
+        + f"    format      {fmt};\n"
+        + '    arch        "LSB;label=32;scalar=64";\n'
+        + f"    class       {obj_class};{loc}\n"
+        + f"    object      {obj_name};\n"
+        + "}\n"
+        + "// * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //\n"
+    )
 
 
 def region_properties(fluid: list[str], solid: list[str]) -> str:
@@ -507,50 +519,124 @@ boundaryField
     )
 
 
-def create_baffles_ami(pairs: list[tuple[str, str]], rot_axis: list[float] | None = None) -> str:
-    """createBafflesDict for cyclicAMI pairs (pre-split)."""
+def create_patch_ami(
+    pairs: list[tuple[str, str]],
+    rot_axis: list[float] | None = None,
+) -> str:
+    """createPatchDict for cyclicAMI rotor/stator patch pairs (pre-split)."""
     axis = rot_axis or [0, 0, 1]
     blocks = []
-    for i, (m, s) in enumerate(pairs):
-        name = f"ami_{i}_{m}"
+    for m, s in pairs:
+        m_name = f"{m}_AMI"
+        s_name = f"{s}_AMI"
         blocks.append(
-            f"""    {name}
+            f"""    {{
+        name            {m_name};
+        patchInfo
+        {{
+            type            cyclicAMI;
+            matchTolerance  0.001;
+            neighbourPatch  {s_name};
+            transform       noOrdering;
+            rotationAxis    ({axis[0]} {axis[1]} {axis[2]});
+        }}
+        constructFrom     patches;
+        patches         ({m});
+    }}
+
     {{
-        type        cyclicAMI;
-        patches     ({m} {s});
-        matchTolerance 0.001;
-        transform   noTransform;
-        rotationAxis ({axis[0]} {axis[1]} {axis[2]});
-        rotationCentre (0 0 0);
+        name            {s_name};
+        patchInfo
+        {{
+            type            cyclicAMI;
+            matchTolerance  0.001;
+            neighbourPatch  {m_name};
+            transform       noOrdering;
+            rotationAxis    ({axis[0]} {axis[1]} {axis[2]});
+        }}
+        constructFrom     patches;
+        patches         ({s});
     }}"""
         )
     inner = "\n\n".join(blocks) if blocks else ""
     return (
-        foam_header("dictionary", "createBafflesDict", "system")
+        foam_header("dictionary", "createPatchDict", "system")
         + f"""
-internalFacesOnly false;
+pointSync false;
 
-baffles
-{{
+patches
+(
 {inner}
-}}
+);
 
 // ************************************************************************* //
 """
     )
 
 
-def topo_set_cell_zones(zones: dict[str, str]) -> str:
-    """topoSetDict that copies existing cellZones into cellSets (for inspection)."""
+def tolerance_dict(
+    point_merge_tol: float = 0.1,
+    edge_merge_tol: float = 0.05,
+) -> str:
+    return (
+        foam_header("dictionary", "toleranceDict", "system")
+        + f"""
+pointMergeTol            {point_merge_tol};
+edgeMergeTol             {edge_merge_tol};
+nFacesPerSlaveEdge       5;
+edgeFaceEscapeLimit      10;
+integralAdjTol           {point_merge_tol};
+edgeMasterCatchFraction  0.4;
+edgeCoPlanarTol          0.8;
+edgeEndCutoffTol         0.0001;
+
+// ************************************************************************* //
+"""
+    )
+
+
+def stitch_mesh_dict(entries: list[tuple[str, str, str]]) -> str:
+    """stitchMeshDict: list of (name, master, slave, match mode)."""
+    blocks = []
+    for name, master, slave, mode in entries:
+        blocks.append(
+            f"""{name}
+{{
+    match   {mode};
+    master  {master};
+    slave   {slave};
+}}"""
+        )
+    inner = "\n\n".join(blocks)
+    return (
+        foam_header("dictionary", "stitchMeshDict", "system")
+        + f"""
+{inner}
+
+// ************************************************************************* //
+"""
+    )
+
+
+def topo_set_cell_zones(zone_names: list[str]) -> str:
+    """topoSetDict: rebuild cellZones from existing zone labels (OpenFOAM CHT prep)."""
     actions = []
-    for zname in zones:
+    for zname in zone_names:
+        set_name = f"{zname}_cells"
         actions.append(
             f"""    {{
-        name    {zname};
-        type    cellZoneSet;
+        name    {set_name};
+        type    cellSet;
         action  new;
         source  zoneToCell;
         zone    {zname};
+    }}
+    {{
+        name    {zname};
+        type    cellZoneSet;
+        action  new;
+        source  setToCellZone;
+        set     {set_name};
     }}"""
         )
     inner = "\n\n".join(actions)

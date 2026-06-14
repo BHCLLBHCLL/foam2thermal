@@ -185,13 +185,13 @@
   },
 
   "mesh_prep": {
-    "coalesce_interfaces": true,
+    "coalesce_interfaces": false,
     "coalesce_point_tol": 1.0e-4,
     "stitch_interfaces": false,
     "stitch_mode": "partial",
     "stitch_integral_ratio_max": 1.05,
     "stitch_partial_ratio_max": 3.0,
-    "coalesce_exclude_patterns": ["ami_rot"],
+    "coalesce_exclude_patterns": [],
     "create_ami_patches": false,
     "stitch_tolerance": {
       "pointMergeTol": 0.1,

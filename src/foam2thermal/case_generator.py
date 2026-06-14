@@ -9,10 +9,11 @@ from pathlib import Path
 
 from .config import CaseConfig
 from .interfaces import InterfaceMethod, build_interface_list
-from .mesh import load_mesh, validate_mesh_complete
+from .mesh import load_mesh, repair_cell_zones, validate_mesh_complete
+from .mesh_coalesce import coalesce_zone_interfaces
 from .templates import (
     control_dict,
-    create_baffles_ami,
+    create_patch_ami,
     field_p,
     field_p_rgh,
     field_T,
@@ -23,8 +24,11 @@ from .templates import (
     fv_solution_solid,
     gravity_vector,
     region_properties,
+    stitch_mesh_dict,
     thermophysical_fluid,
     thermophysical_solid,
+    tolerance_dict,
+    topo_set_cell_zones,
     turbulence_properties,
 )
 
@@ -34,18 +38,38 @@ def _write(path: Path, content: str) -> None:
     path.write_text(content, encoding="utf-8", newline="\n")
 
 
-def _copy_mesh(source: Path, dest: Path) -> None:
+def _copy_mesh(source: Path, dest: Path, mesh_prep: dict) -> dict:
     src_poly = source / "constant" / "polyMesh"
     dst_poly = dest / "constant" / "polyMesh"
     if dst_poly.exists():
         shutil.rmtree(dst_poly)
     shutil.copytree(src_poly, dst_poly)
+    repair_cell_zones(dst_poly)
+    coalesce_report: dict = {"paired_faces": 0}
+    if mesh_prep.get("coalesce_interfaces", True):
+        tol = float(mesh_prep.get("coalesce_point_tol", 1e-4))
+        coalesce_report = coalesce_zone_interfaces(
+            dst_poly,
+            point_tol=tol,
+            exclude_patterns=mesh_prep.get("coalesce_exclude_patterns", [r"ami_rot"]),
+        )
+    return coalesce_report
+
+
+def _copy_system_for_prep(source: Path, dest: Path) -> None:
+    """Copy input mesh system/* for monolithic-mesh utilities (stitchMesh, split)."""
+    src_sys = source / "system"
+    dst_sys = dest / "system"
+    dst_sys.mkdir(parents=True, exist_ok=True)
+    for name in ("controlDict", "fvSchemes", "fvSolution"):
+        src = src_sys / name
+        if src.is_file():
+            shutil.copy2(src, dst_sys / name)
 
 
 def _infer_patch_region(patch: str, cfg: CaseConfig) -> str | None:
     if patch in cfg.patch_regions:
         return cfg.patch_regions[patch]
-    # Heuristic: *_s* solid component surfaces → solid region
     base = re.sub(r"_\d+$", "", patch)
     if base.endswith("_s") or base in ("CU", "Cover", "fin1", "fin2", "impeller2", "case1", "case2"):
         for r in cfg.solid_regions:
@@ -106,31 +130,32 @@ def generate_case(cfg: CaseConfig, *, dry_run: bool = False) -> dict:
         shutil.rmtree(out)
     out.mkdir(parents=True)
 
-    _copy_mesh(cfg.source_case, out)
+    coalesce_report = _copy_mesh(cfg.source_case, out, cfg.mesh_prep)
+    report["mesh_coalesce"] = coalesce_report
+    mesh = load_mesh(out)
+    _copy_system_for_prep(cfg.source_case, out)
 
-    # --- constant (regionProperties written in Allrun.pre before split) ---
+    # --- staged region configs (deployed after splitMeshRegions) ---
+    _write(out / "constant" / "g", gravity_vector(cfg.gravity))
     _write(
         out / "system" / "regionProperties",
         region_properties(cfg.fluid_regions, cfg.solid_regions),
     )
-    _write(out / "constant" / "g", gravity_vector(cfg.gravity))
+    _write(
+        out / "system" / "controlDict.cht",
+        control_dict(cfg.numerics, cfg.solver),
+    )
 
     for reg in cfg.regions:
         mat = cfg.material_for(reg.foam_name)
-        cdir = out / "constant" / reg.foam_name
+        cdir = out / "constant.orig" / reg.foam_name
         if reg.type == "fluid":
             _write(cdir / "thermophysicalProperties", thermophysical_fluid(mat))
             _write(cdir / "turbulenceProperties", turbulence_properties(cfg.turbulence))
         else:
             _write(cdir / "thermophysicalProperties", thermophysical_solid(mat))
 
-    # --- system ---
-    _write(out / "system" / "controlDict", control_dict(cfg.numerics, cfg.solver))
-    _write(out / "system" / "fvSchemes", fv_schemes_fluid())
-    _write(out / "system" / "fvSolution", fv_solution_fluid(cfg.numerics))
-
-    for reg in cfg.regions:
-        sdir = out / "system" / reg.foam_name
+        sdir = out / "system.orig" / reg.foam_name
         if reg.type == "fluid":
             _write(sdir / "fvSchemes", fv_schemes_fluid())
             _write(sdir / "fvSolution", fv_solution_fluid(cfg.numerics))
@@ -153,69 +178,201 @@ def generate_case(cfg: CaseConfig, *, dry_run: bool = False) -> dict:
             _write(odir / "U", field_U(patches, rbc.get("U", {}), U0))
             _write(odir / "p_rgh", field_p_rgh(patches, 0))
 
-    # AMI baffles dict
     ami_pairs = [
         (i.master, i.slave)
         for i in interfaces
         if i.method == InterfaceMethod.CYCLIC_AMI
     ]
-    if ami_pairs:
+    ami_on_mesh = [
+        (m, s) for m, s in ami_pairs
+        if m in mesh.patch_names and s in mesh.patch_names
+    ]
+    if ami_on_mesh:
         rot_axis = cfg.interfaces.get("ami_rotation_axis", [0, 0, 1])
         _write(
-            out / "system" / "createBafflesDict",
-            create_baffles_ami(ami_pairs, rot_axis),
+            out / "system" / "createPatchDict",
+            create_patch_ami(ami_on_mesh, rot_axis),
         )
 
-    # --- run scripts ---
+    tol = cfg.mesh_prep.get("stitch_tolerance", {})
+    _write(
+        out / "system" / "toleranceDict",
+        tolerance_dict(
+            float(tol.get("pointMergeTol", 0.1)),
+            float(tol.get("edgeMergeTol", 0.05)),
+        ),
+    )
+
+    stitch_entries = _stitch_dict_entries(interfaces, mesh, cfg.mesh_prep)
+    if stitch_entries:
+        _write(out / "system" / "stitchMeshDict", stitch_mesh_dict(stitch_entries))
+
+    _write(
+        out / "system" / "topoSetDict",
+        topo_set_cell_zones(zone_names),
+    )
+
+    scripts_src = Path(__file__).resolve().parents[2] / "scripts"
+    scripts_dst = out / "scripts"
+    scripts_dst.mkdir(parents=True, exist_ok=True)
+    for name in ("relocateRegionMeshes.sh", "verifyRegions.sh", "split_regions.py"):
+        src = scripts_src / name
+        if src.is_file():
+            shutil.copy2(src, scripts_dst / name)
+
     _write(out / "setup_report.json", json.dumps(report, indent=2))
-    _write(out / "Allrun.pre", _allrun_pre(cfg, interfaces))
+    _write(out / "Allrun.pre", _allrun_pre(cfg, interfaces, mesh, ami_on_mesh))
     _write(out / "Allrun", _allrun(cfg))
     _write(out / "Allclean", _allclean())
 
     return report
 
 
-def _allrun_pre(cfg: CaseConfig, interfaces) -> str:
-    stitch = cfg.mesh_prep.get("stitch_interfaces", True)
-    split_opts = list(cfg.mesh_prep.get("split_options", ["-cellZonesOnly", "-overwrite"]))
-    combine = cfg.mesh_prep.get("combine_zones", {})
+def _stitch_command(
+    master: str,
+    slave: str,
+    mesh,
+    mesh_prep: dict,
+) -> str | None:
+    """Return runApplication stitchMesh line, or None to skip."""
+    by_name = {p.name: p for p in mesh.patches}
+    if master not in by_name or slave not in by_name:
+        return None
+    nf_m = by_name[master].n_faces
+    nf_s = by_name[slave].n_faces
+    ratio = max(nf_m, nf_s) / max(min(nf_m, nf_s), 1)
+    max_integral = mesh_prep.get("stitch_integral_ratio_max", 1.05)
+    max_partial = mesh_prep.get("stitch_partial_ratio_max", 3.0)
+    stitch_mode = mesh_prep.get("stitch_mode", "partial")
+
+    if ratio > max_partial:
+        return f"# SKIP stitch {master}/{slave}: face ratio {ratio:.2f} > {max_partial}"
+
+    tag = _safe_stitch_name(master, slave)
+    if stitch_mode == "partial":
+        mode = "-partial"
+    elif stitch_mode == "integral":
+        mode = ""
+    else:  # auto
+        mode = "-partial" if ratio > max_integral else ""
+    parts = ["runApplication", f"-s stitch_{tag}", "stitchMesh"]
+    if mode:
+        parts.append(mode)
+    parts.extend(["-overwrite", "-toleranceDict", "system/toleranceDict", master, slave])
+    return " ".join(parts)
+
+
+def _stitch_dict_entries(interfaces, mesh, mesh_prep: dict) -> list[tuple[str, str, str, str]]:
+    """Build stitchMeshDict entries: (key, master, slave, match mode)."""
+    if not mesh_prep.get("stitch_interfaces", False):
+        return []
+    by_name = {p.name: p for p in mesh.patches}
+    max_integral = mesh_prep.get("stitch_integral_ratio_max", 1.05)
+    max_partial = mesh_prep.get("stitch_partial_ratio_max", 3.0)
+    stitch_mode = mesh_prep.get("stitch_mode", "partial")
+    entries: list[tuple[str, str, str, str]] = []
+    for iface in interfaces:
+        if iface.method.value != "stitch":
+            continue
+        master, slave = iface.master, iface.slave
+        if master not in by_name or slave not in by_name:
+            continue
+        nf_m = by_name[master].n_faces
+        nf_s = by_name[slave].n_faces
+        ratio = max(nf_m, nf_s) / max(min(nf_m, nf_s), 1)
+        if ratio > max_partial:
+            continue
+        if stitch_mode == "partial":
+            mode = "partial"
+        elif stitch_mode == "integral":
+            mode = "integral"
+        else:
+            mode = "partial" if ratio > max_integral else "integral"
+        key = _safe_stitch_name(master, slave)
+        entries.append((key, master, slave, mode))
+    return entries
+
+
+def _safe_stitch_name(master: str, slave: str) -> str:
+    return re.sub(r"[^A-Za-z0-9_]+", "_", f"{master}_{slave}")[:48]
+
+
+def _allrun_pre(cfg: CaseConfig, interfaces, mesh, ami_on_mesh: list[tuple[str, str]]) -> str:
+    mesh_prep = cfg.mesh_prep
+    stitch = mesh_prep.get("stitch_interfaces", False)
+    split_opts = list(mesh_prep.get("split_options", ["-cellZonesOnly", "-overwrite"]))
+    combine = dict(mesh_prep.get("combine_zones", {}))
     for reg in cfg.regions:
         if len(reg.cell_zones) > 1:
             combine.setdefault(reg.name, reg.cell_zones)
 
-    for reg_name, zone_list in combine.items():
+    for _reg_name, zone_list in combine.items():
         zones_str = " ".join(zone_list)
-        split_opts.append(f"-combineZones")
-        split_opts.append(f"({zones_str})")
+        split_opts.extend(["-combineZones", f"({zones_str})"])
 
     split_cmd = " ".join(split_opts)
+    region_names = " ".join(reg.foam_name for reg in cfg.regions)
 
     lines = [
         "#!/bin/sh",
+        "set -e",
+        "export FOAM_SIGFPE=0 FOAM_SETNAN=0",
         'cd "${0%/*}" || exit',
         ". ${WM_PROJECT_DIR:?}/bin/tools/RunFunctions",
         "#------------------------------------------------------------------------------",
-        "# Generated by foam2thermal – mesh prep for chtMultiRegionSimpleFoam",
+        "# foam2thermal – mesh prep (monolithic mesh, no constant/<region> yet)",
         "",
     ]
 
     if stitch:
+        lines.extend([
+            "# Optional stitch for remaining unmatched interface patches",
+            "set +e",
+            "STITCH_FAIL=0",
+        ])
         for iface in interfaces:
             if iface.method.value != "stitch":
                 continue
-            lines.append(
-                f"runApplication stitchMesh -overwrite {iface.master} {iface.slave}"
-            )
+            cmd = _stitch_command(iface.master, iface.slave, mesh, mesh_prep)
+            if cmd and not cmd.startswith("# SKIP"):
+                lines.append(f"{cmd} || STITCH_FAIL=$((STITCH_FAIL + 1))")
+            elif cmd:
+                lines.append(cmd)
+        lines.extend([
+            "set -e",
+            'if [ "$STITCH_FAIL" -gt 0 ]; then',
+            '    echo "WARNING: $STITCH_FAIL stitchMesh pair(s) failed – see log.stitchMesh.*"',
+            "fi",
+            "",
+        ])
 
-    ami_pairs = [i for i in interfaces if i.method.value == "cyclicAMI"]
-    if ami_pairs:
-        lines.append("runApplication createBaffles -overwrite")
+    if ami_on_mesh and mesh_prep.get("create_ami_patches", False):
+        lines.append("runApplication -s createPatch createPatch -overwrite")
 
     lines.extend([
+        "set +e",
+        "runApplication -s checkMesh checkMesh -noTopology",
+        "CM=$?",
+        "set -e",
+        'if [ "$CM" -ne 0 ]; then echo "WARNING: checkMesh exit $CM (see log.checkMesh.checkMesh)"; fi',
+        "runApplication -s topoSet topoSet",
         "cp system/regionProperties constant/regionProperties",
-        f"runApplication splitMeshRegions {split_cmd}",
+        "# splitMeshRegions crashes on Windows MinGW when writing regional meshes;",
+        "# use foam2thermal Python splitter (same topology, CHT _to_ patches).",
+        'FOAM2THERMAL_ROOT="$(cd "${0%/*}/../.." && pwd)"',
+        'export PYTHONPATH="${FOAM2THERMAL_ROOT}/src:${PYTHONPATH}"',
+        'python "${0%/*}/scripts/split_regions.py" "$(pwd)"',
+        "sh scripts/verifyRegions.sh",
         "",
-        "# Restore initial fields per region",
+        "# Deploy per-region constant/system and CHT controlDict",
+        f"for region in {region_names}; do",
+        '    mkdir -p "constant/${region}" "system/${region}"',
+        '    cp -f constant.orig/"${region}"/* "constant/${region}/" 2>/dev/null || true',
+        '    cp -f system.orig/"${region}"/* "system/${region}/" 2>/dev/null || true',
+        "done",
+        "cp -f system/controlDict.cht system/controlDict",
+        "runApplication -s renumberMesh renumberMesh -allRegions -overwrite",
+        "",
         "restore0Dir -allRegions",
         "",
         "# Remove incompatible fields (fluid-only / solid-only)",
@@ -225,8 +382,6 @@ def _allrun_pre(cfg: CaseConfig, interfaces) -> str:
         if reg.type == "solid":
             for f in ("U", "p_rgh", "k", "epsilon", "nut", "alphat"):
                 lines.append(f"rm -f 0/{reg.foam_name}/{f} 2>/dev/null || true")
-        else:
-            lines.append(f"# fluid region {reg.foam_name}: keep U, p_rgh, T")
 
     lines.append("")
     lines.append("#------------------------------------------------------------------------------")
@@ -236,11 +391,12 @@ def _allrun_pre(cfg: CaseConfig, interfaces) -> str:
 def _allrun(cfg: CaseConfig) -> str:
     return "\n".join([
         "#!/bin/sh",
+        "set -e",
         'cd "${0%/*}" || exit',
         ". ${WM_PROJECT_DIR:?}/bin/tools/RunFunctions",
         "#------------------------------------------------------------------------------",
         "./Allrun.pre",
-        f"runApplication $(getApplication)",
+        "runApplication $(getApplication)",
         "#------------------------------------------------------------------------------",
         "",
     ])

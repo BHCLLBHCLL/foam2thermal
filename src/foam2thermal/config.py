@@ -72,17 +72,14 @@ class CaseConfig:
         raise KeyError(f"No material mapping for region '{region}'")
 
 
-def _resolve(base: Path, value: str) -> Path:
-    p = Path(value)
-    return p if p.is_absolute() else (base / p).resolve()
-
-
-def load_config(path: Path) -> CaseConfig:
-    base = path.parent.resolve()
-    raw = json.loads(path.read_text(encoding="utf-8"))
-
-    case = raw["case"]
-    of = raw["openfoam"]
+def load_config(
+    config_path: Path,
+    input_mesh: Path,
+    output_case: Path,
+) -> CaseConfig:
+    """Load JSON config; *input_mesh* and *output_case* come from CLI positional args."""
+    raw = json.loads(config_path.read_text(encoding="utf-8"))
+    of = raw.get("openfoam", {})
 
     regions = [
         RegionDef(
@@ -101,8 +98,8 @@ def load_config(path: Path) -> CaseConfig:
 
     return CaseConfig(
         raw=raw,
-        source_case=_resolve(base, case["source"]),
-        output_case=_resolve(base, case.get("output", case["source"] + "_cht")),
+        source_case=input_mesh.resolve(),
+        output_case=output_case.resolve(),
         openfoam_root=Path(of["root"]),
         bash_exe=Path(of.get("bash", r"C:\OF\v2412\msys64\usr\bin\bash.exe")),
         solver=of.get("solver", "chtMultiRegionSimpleFoam"),
