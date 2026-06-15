@@ -56,5 +56,16 @@ def run_allrun_pre(bash_exe: Path, of_root: Path, case_dir: Path) -> subprocess.
     )
 
 
-def run_solver(bash_exe: Path, of_root: Path, case_dir: Path) -> subprocess.CompletedProcess[str]:
-    return run_openfoam(bash_exe, of_root, case_dir, "./Allrun")
+def run_solver(
+    bash_exe: Path,
+    of_root: Path,
+    case_dir: Path,
+    *,
+    solver: str = "chtMultiRegionSimpleFoam",
+) -> subprocess.CompletedProcess[str]:
+    return run_openfoam(
+        bash_exe,
+        of_root,
+        case_dir,
+        f". ${{WM_PROJECT_DIR:?}}/bin/tools/RunFunctions && runApplication {solver}",
+    )

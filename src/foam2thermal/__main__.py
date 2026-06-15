@@ -138,7 +138,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
 
     if args.step in ("all", "solve"):
         print(f"Running solver in {output_case} ...")
-        result = run_solver(cfg.bash_exe, cfg.openfoam_root, output_case)
+        result = run_solver(cfg.bash_exe, cfg.openfoam_root, output_case, solver=cfg.solver)
         if result.stdout:
             print(result.stdout)
         if result.stderr:

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from .interfaces import is_ami_patch
+
 
 _OF_BANNER = """/*--------------------------------*- C++ -*----------------------------------*\\
 | =========                 |                                                 |
@@ -370,14 +372,64 @@ def _bc_block(name: str, spec: dict[str, Any], field: str) -> str:
     return "\n".join(lines)
 
 
-def field_T(region_type: str, patches: list[str], bc_cfg: dict[str, Any], T0: float) -> str:
+def mrf_properties(
+    cell_zones: list[str],
+    origin: tuple[float, float, float],
+    axis: list[float],
+    omega: float,
+    non_rotating: list[str],
+) -> str:
+    zones_s = " ".join(cell_zones)
+    nr = " ".join(non_rotating) if non_rotating else "()"
+    if non_rotating:
+        nr_block = f"nonRotatingPatches ( {nr} );"
+    else:
+        nr_block = "nonRotatingPatches ();"
+    ox, oy, oz = origin
+    ax, ay, az = axis
+    return (
+        foam_header("dictionary", "MRFProperties", "constant")
+        + f"""
+MRF
+{{
+    cellZones           ({zones_s});
+    active              yes;
+    {nr_block}
+    origin              ({ox} {oy} {oz});
+    axis                ({ax} {ay} {az});
+    omega               {omega};
+}}
+
+// ************************************************************************* //
+"""
+    )
+
+
+def _cyclic_ami_bc(field: str) -> str:
+    return f"""    {{
+        type            cyclicAMI;
+    }}"""
+
+
+def field_T(
+    region_type: str,
+    patches: list[str],
+    bc_cfg: dict[str, Any],
+    T0: float,
+    *,
+    ami_patterns: list[str] | None = None,
+) -> str:
     """Temperature field with coupled BC auto-detection."""
     blocks = ['     #includeEtc "caseDicts/setConstraintTypes"']
     kappa = "fluidThermo" if region_type == "fluid" else "solidThermo"
 
+    ami_patterns = ami_patterns or [r"ami_rot\d+"]
+
     for p in patches:
         if p in bc_cfg:
             blocks.append(_bc_block(p, bc_cfg[p], "T"))
+        elif is_ami_patch(p, ami_patterns):
+            blocks.append(f"    {p}\n{_cyclic_ami_bc('T')}")
         elif "_to_" in p:
             blocks.append(
                 f"""    {p}
@@ -422,12 +474,21 @@ boundaryField
     )
 
 
-def field_U(patches: list[str], bc_cfg: dict[str, Any], U0: list[float]) -> str:
+def field_U(
+    patches: list[str],
+    bc_cfg: dict[str, Any],
+    U0: list[float],
+    *,
+    ami_patterns: list[str] | None = None,
+) -> str:
     blocks = ['     #includeEtc "caseDicts/setConstraintTypes"']
     ux, uy, uz = U0
+    ami_patterns = ami_patterns or [r"ami_rot\d+"]
     for p in patches:
         if p in bc_cfg:
             blocks.append(_bc_block(p, bc_cfg[p], "U"))
+        elif is_ami_patch(p, ami_patterns):
+            blocks.append(f"    {p}\n{_cyclic_ami_bc('U')}")
         elif "_to_" in p:
             blocks.append(
                 f"""    {p}
@@ -458,10 +519,18 @@ boundaryField
     )
 
 
-def field_p(patches: list[str], p0: float) -> str:
+def field_p(
+    patches: list[str],
+    p0: float,
+    *,
+    ami_patterns: list[str] | None = None,
+) -> str:
     blocks = ['     #includeEtc "caseDicts/setConstraintTypes"']
+    ami_patterns = ami_patterns or [r"ami_rot\d+"]
     for p in patches:
-        if "_to_" in p:
+        if is_ami_patch(p, ami_patterns):
+            blocks.append(f"    {p}\n{_cyclic_ami_bc('p')}")
+        elif "_to_" in p:
             blocks.append(
                 f"""    {p}
     {{
@@ -493,16 +562,25 @@ boundaryField
     )
 
 
-def field_p_rgh(patches: list[str], p0: float) -> str:
+def field_p_rgh(
+    patches: list[str],
+    p0: float,
+    *,
+    ami_patterns: list[str] | None = None,
+) -> str:
     blocks = ['     #includeEtc "caseDicts/setConstraintTypes"']
+    ami_patterns = ami_patterns or [r"ami_rot\d+"]
     for p in patches:
-        blocks.append(
-            f"""    {p}
+        if is_ami_patch(p, ami_patterns):
+            blocks.append(f"    {p}\n{_cyclic_ami_bc('p_rgh')}")
+        else:
+            blocks.append(
+                f"""    {p}
     {{
         type            fixedFluxPressure;
         value           $internalField;
     }}"""
-        )
+            )
     return (
         foam_header("volScalarField", "p_rgh", "0")
         + f"""
@@ -522,21 +600,20 @@ boundaryField
 def create_patch_ami(
     pairs: list[tuple[str, str]],
     rot_axis: list[float] | None = None,
+    match_tolerance: float = 0.001,
 ) -> str:
-    """createPatchDict for cyclicAMI rotor/stator patch pairs (pre-split)."""
+    """createPatchDict: convert cgns2foam AMI wall pairs to cyclicAMI (pre-split)."""
     axis = rot_axis or [0, 0, 1]
     blocks = []
     for m, s in pairs:
-        m_name = f"{m}_AMI"
-        s_name = f"{s}_AMI"
         blocks.append(
             f"""    {{
-        name            {m_name};
+        name            {m};
         patchInfo
         {{
             type            cyclicAMI;
-            matchTolerance  0.001;
-            neighbourPatch  {s_name};
+            matchTolerance  {match_tolerance};
+            neighbourPatch  {s};
             transform       noOrdering;
             rotationAxis    ({axis[0]} {axis[1]} {axis[2]});
         }}
@@ -545,12 +622,12 @@ def create_patch_ami(
     }}
 
     {{
-        name            {s_name};
+        name            {s};
         patchInfo
         {{
             type            cyclicAMI;
-            matchTolerance  0.001;
-            neighbourPatch  {m_name};
+            matchTolerance  {match_tolerance};
+            neighbourPatch  {m};
             transform       noOrdering;
             rotationAxis    ({axis[0]} {axis[1]} {axis[2]});
         }}

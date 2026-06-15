@@ -14,6 +14,99 @@ class PatchInfo:
     patch_type: str
     n_faces: int
     start_face: int
+    sample_mode: str | None = None
+    sample_region: str | None = None
+    sample_patch: str | None = None
+    neighbour_patch: str | None = None
+    rotation_axis: tuple[float, float, float] | None = None
+    match_tolerance: float | None = None
+    transform: str | None = None
+
+
+def coupling_patch_name(local_region: str, remote_region: str) -> str:
+    return f"{local_region}_to_{remote_region}"
+
+
+def parse_coupling_patch(name: str, region_names: list[str]) -> tuple[str, str] | None:
+    """Return (local_region, remote_region) for a ``*_to_*`` patch name."""
+    for local in region_names:
+        prefix = f"{local}_to_"
+        if name.startswith(prefix):
+            return local, name[len(prefix) :]
+    return None
+
+
+def mapped_wall_patch(
+    local_region: str,
+    remote_region: str,
+    *,
+    n_faces: int,
+    start_face: int,
+) -> PatchInfo:
+    return PatchInfo(
+        name=coupling_patch_name(local_region, remote_region),
+        patch_type="mappedWall",
+        n_faces=n_faces,
+        start_face=start_face,
+        sample_mode="nearestPatchFace",
+        sample_region=remote_region,
+        sample_patch=coupling_patch_name(remote_region, local_region),
+    )
+
+
+def cyclic_ami_patch(
+    name: str,
+    neighbour: str,
+    *,
+    n_faces: int,
+    start_face: int,
+    rotation_axis: tuple[float, float, float] = (0.0, 0.0, 1.0),
+    match_tolerance: float = 0.001,
+    transform: str = "noOrdering",
+) -> PatchInfo:
+    return PatchInfo(
+        name=name,
+        patch_type="cyclicAMI",
+        n_faces=n_faces,
+        start_face=start_face,
+        neighbour_patch=neighbour,
+        rotation_axis=rotation_axis,
+        match_tolerance=match_tolerance,
+        transform=transform,
+    )
+
+
+def boundary_header_text(path: Path) -> str:
+    """FoamFile header only (no patch count/list) for rewriting boundary."""
+    text = path.read_text(encoding="utf-8", errors="replace")
+    end = text.find("\n(\n")
+    if end >= 0:
+        chunk = text[:end]
+        chunk = re.sub(r"(\n\d+\s*)+$", "", chunk)
+        return chunk + "\n"
+    return text.split("(")[0].rstrip() + "\n"
+
+
+def write_boundary(path: Path, patches: list[PatchInfo], header_text: str) -> None:
+    lines = [header_text, f"{len(patches)}\n(\n"]
+    for p in patches:
+        lines.append(f"\n\t{p.name}\n\t{{\n")
+        lines.append(f"\t\ttype            {p.patch_type};\n")
+        if p.patch_type == "mappedWall":
+            lines.append(f"\t\tsampleMode      {p.sample_mode or 'nearestPatchFace'};\n")
+            lines.append(f"\t\tsampleRegion    {p.sample_region};\n")
+            lines.append(f"\t\tsamplePatch     {p.sample_patch};\n")
+        elif p.patch_type == "cyclicAMI":
+            ax = p.rotation_axis or (0.0, 0.0, 1.0)
+            lines.append(f"\t\tneighbourPatch  {p.neighbour_patch};\n")
+            lines.append(f"\t\tmatchTolerance  {p.match_tolerance or 0.001};\n")
+            lines.append(f"\t\ttransform       {p.transform or 'noOrdering'};\n")
+            lines.append(f"\t\trotationAxis    ({ax[0]} {ax[1]} {ax[2]});\n")
+        lines.append(f"\t\tnFaces          {p.n_faces};\n")
+        lines.append(f"\t\tstartFace       {p.start_face};\n")
+        lines.append("\t}\n")
+    lines.append(")\n")
+    path.write_text("".join(lines), encoding="utf-8", newline="\n")
 
 
 @dataclass
@@ -65,12 +158,48 @@ def parse_boundary(path: Path) -> list[PatchInfo]:
             n_faces, start_face = int(m.group(3)), int(m.group(4))
         else:
             start_face, n_faces = int(m.group(5)), int(m.group(6))
+        block_start = m.start()
+        block_end = m.end()
+        block = text[block_start:block_end]
+        neighbour = None
+        nm = re.search(r"neighbourPatch\s+(\S+);", block)
+        if nm:
+            neighbour = nm.group(1)
+        axis = None
+        am = re.search(
+            r"rotationAxis\s+\(([-\d.eE+]+)\s+([-\d.eE+]+)\s+([-\d.eE+]+)\);", block
+        )
+        if am:
+            axis = (float(am.group(1)), float(am.group(2)), float(am.group(3)))
+        mt = re.search(r"matchTolerance\s+([\d.eE+-]+);", block)
+        match_tol = float(mt.group(1)) if mt else None
+        tr = re.search(r"transform\s+(\S+);", block)
+        transform = tr.group(1) if tr else None
+        sample_mode = None
+        sample_region = None
+        sample_patch = None
+        sm = re.search(r"sampleMode\s+(\S+);", block)
+        if sm:
+            sample_mode = sm.group(1)
+        sr = re.search(r"sampleRegion\s+(\S+);", block)
+        if sr:
+            sample_region = sr.group(1)
+        sp = re.search(r"samplePatch\s+(\S+);", block)
+        if sp:
+            sample_patch = sp.group(1)
         patches.append(
             PatchInfo(
                 name=m.group(1),
                 patch_type=m.group(2),
                 n_faces=n_faces,
                 start_face=start_face,
+                sample_mode=sample_mode,
+                sample_region=sample_region,
+                sample_patch=sample_patch,
+                neighbour_patch=neighbour,
+                rotation_axis=axis,
+                match_tolerance=match_tol,
+                transform=transform,
             )
         )
     return patches
@@ -171,6 +300,42 @@ def repair_cell_zones(poly_dir: Path) -> None:
     zones = parse_cell_zones(cz)
     if zones and b"type cellZone" not in raw:
         write_cell_zones_v2412(cz, zones)
+
+
+def zone_bbox_centroid(poly_dir: Path, zone_names: list[str]) -> tuple[float, float, float]:
+    """Bounding-box centre of one or more cellZones (for MRF origin)."""
+    import numpy as np
+
+    from .mesh_coalesce import (
+        _read_ascii_face_list,
+        _read_binary_label_list,
+        _read_binary_vector_field,
+    )
+
+    points = _read_binary_vector_field(poly_dir / "points")
+    zones = {z.name: z for z in parse_cell_zones(poly_dir / "cellZones")}
+    cell_set: set[int] = set()
+    for name in zone_names:
+        z = zones.get(name)
+        if z:
+            cell_set.update(z.cell_labels)
+    if not cell_set:
+        return (0.0, 0.0, 0.0)
+
+    owner = _read_binary_label_list(poly_dir / "owner")
+    offsets, conn = _read_ascii_face_list(poly_dir / "faces")
+    used_pts: set[int] = set()
+    for fi, own in enumerate(owner):
+        if int(own) not in cell_set:
+            continue
+        s, e = int(offsets[fi]), int(offsets[fi + 1])
+        used_pts.update(int(v) for v in conn[s:e])
+    if not used_pts:
+        return (0.0, 0.0, 0.0)
+    idx = np.fromiter(used_pts, dtype=np.int64)
+    pts = points[idx]
+    c = 0.5 * (pts.min(axis=0) + pts.max(axis=0))
+    return (float(c[0]), float(c[1]), float(c[2]))
 
 
 def load_mesh(case_dir: Path) -> MeshInfo:

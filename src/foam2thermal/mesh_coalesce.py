@@ -7,7 +7,7 @@ from pathlib import Path
 
 import numpy as np
 
-from .mesh import PatchInfo, parse_boundary, parse_cell_zones
+from .mesh import PatchInfo, parse_boundary, parse_cell_zones, write_boundary
 
 _DATA_COUNT_RE = re.compile(rb"\n(\d+)\s*\n\(")
 
@@ -135,20 +135,6 @@ def _write_binary_label_list(path: Path, values: np.ndarray, header: bytes) -> N
         fh.write(f"{arr.size}\n(".encode("ascii"))
         fh.write(arr.tobytes(order="C"))
         fh.write(b")\n")
-
-
-def _write_boundary(path: Path, patches: list[PatchInfo], header_text: str) -> None:
-    lines = [header_text, f"{len(patches)}\n(\n"]
-    for p in patches:
-        lines.append(
-            f"\n\t{p.name}\n\t{{\n"
-            f"\t\ttype {p.patch_type};\n"
-            f"\t\tstartFace {p.start_face};\n"
-            f"\t\tnFaces {p.n_faces};\n"
-            f"\t}}\n"
-        )
-    lines.append(")\n")
-    path.write_text("".join(lines), encoding="utf-8", newline="\n")
 
 
 def _compact_mesh(
@@ -330,7 +316,7 @@ def coalesce_zone_interfaces(
     _write_binary_label_list(
         neighbour_path, final_nb[:n_internal].astype(np.int32), _read_header_bytes(neighbour_path)
     )
-    _write_boundary(boundary_path, final_patches, _boundary_header_text(boundary_path))
+    write_boundary(boundary_path, final_patches, _boundary_header_text(boundary_path))
 
     return {
         "paired_faces": paired,

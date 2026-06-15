@@ -18,7 +18,7 @@ class RegionDef:
     @property
     def foam_name(self) -> str:
         """OpenFOAM region name after splitMeshRegions."""
-        if len(self.cell_zones) == 1:
+        if self.cell_zones:
             return self.cell_zones[0]
         return self.name
 

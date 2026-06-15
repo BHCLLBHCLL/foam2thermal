@@ -9,7 +9,13 @@ from pathlib import Path
 
 import numpy as np
 
-from .mesh import PatchInfo, parse_boundary, parse_cell_zones
+from .mesh import (
+    PatchInfo,
+    mapped_wall_patch,
+    parse_boundary,
+    parse_cell_zones,
+    write_boundary,
+)
 from .mesh_coalesce import (
     _read_ascii_face_list,
     _read_binary_label_list,
@@ -17,7 +23,6 @@ from .mesh_coalesce import (
     _write_ascii_face_list,
     _write_binary_label_list,
     _write_binary_vector_field,
-    _write_boundary,
 )
 
 _LABEL_IO_COUNT = re.compile(rb"\n(\d+)\s*\n\(")
@@ -53,10 +58,13 @@ def _region_names_from_properties(case_dir: Path) -> list[str]:
             continue
         text = rp.read_text(encoding="utf-8", errors="replace")
         names: list[str] = []
-        for block in ("regions", "fluid", "solid"):
+        for block in ("fluid", "solid"):
             m = re.search(rf"{block}\s*\(\s*([^)]+)\)", text, flags=re.DOTALL)
-            if m:
-                names.extend(re.findall(r'"([^"]+)"', m.group(1)))
+            if not m:
+                continue
+            chunk = m.group(1).strip()
+            quoted = re.findall(r'"([^"]+)"', chunk)
+            names.extend(quoted if quoted else chunk.split())
         if names:
             return names
     raise FileNotFoundError("regionProperties not found")
@@ -154,7 +162,19 @@ def _extract_region_mesh(
         if not faces:
             continue
         final_patches.append(
-            PatchInfo(name=p.name, patch_type=p.patch_type, n_faces=len(faces), start_face=cursor)
+            PatchInfo(
+                name=p.name,
+                patch_type=p.patch_type,
+                n_faces=len(faces),
+                start_face=cursor,
+                sample_mode=p.sample_mode,
+                sample_region=p.sample_region,
+                sample_patch=p.sample_patch,
+                neighbour_patch=p.neighbour_patch,
+                rotation_axis=p.rotation_axis,
+                match_tolerance=p.match_tolerance,
+                transform=p.transform,
+            )
         )
         for v, o in faces:
             ordered.append((v, o, None))
@@ -162,8 +182,14 @@ def _extract_region_mesh(
 
     for pname in sorted(coupling.keys()):
         faces = coupling[pname]
+        remote = pname[len(region_name) + 4 :]  # strip "{region}_to_"
         final_patches.append(
-            PatchInfo(name=pname, patch_type="wall", n_faces=len(faces), start_face=cursor)
+            mapped_wall_patch(
+                region_name,
+                remote,
+                n_faces=len(faces),
+                start_face=cursor,
+            )
         )
         for v, o in faces:
             ordered.append((v, o, None))
@@ -216,7 +242,46 @@ def _write_region_poly(
         nb[:n_internal].astype(np.int32),
         _default_header("labelList", "neighbour"),
     )
-    _write_boundary(poly_dir / "boundary", patches, _default_boundary_header())
+    write_boundary(poly_dir / "boundary", patches, _default_boundary_header())
+
+
+def interface_neighbors(case_dir: Path) -> dict[str, list[str]]:
+    """Map each region name to coupled neighbour region names (from monolithic mesh)."""
+    poly = case_dir / "constant" / "polyMesh"
+    if not poly.is_dir():
+        return {}
+    owner = _read_binary_label_list(poly / "owner")
+    nb_raw = _read_binary_label_list(poly / "neighbour")
+    n_cells = int(owner.max()) + 1
+    cell_region, names = _cell_region_map(case_dir, poly, n_cells)
+    nb = np.full(owner.size, -1, dtype=np.int32)
+    nb[: nb_raw.size] = nb_raw
+
+    neighbors: dict[str, set[str]] = {n: set() for n in names}
+    for fi in range(owner.size):
+        n = int(nb[fi])
+        if n < 0:
+            continue
+        o = int(owner[fi])
+        ro, rn = int(cell_region[o]), int(cell_region[n])
+        if ro != rn and ro >= 0 and rn >= 0:
+            neighbors[names[ro]].add(names[rn])
+            neighbors[names[rn]].add(names[ro])
+    return {k: sorted(v) for k, v in neighbors.items()}
+
+
+def field_patches_for_region(
+    region_foam_name: str,
+    *,
+    config_name: str,
+    monolithic_patch_names: list[str],
+    patch_region: dict[str, str],
+    neighbors: dict[str, list[str]],
+) -> list[str]:
+    """Patch names for 0/ fields after region split."""
+    ext = [p for p in monolithic_patch_names if patch_region.get(p) == config_name]
+    coupled = [f"{region_foam_name}_to_{nbr}" for nbr in neighbors.get(region_foam_name, [])]
+    return ext + sorted(coupled)
 
 
 def split_mesh_regions(case_dir: Path, region_names: list[str] | None = None) -> dict:

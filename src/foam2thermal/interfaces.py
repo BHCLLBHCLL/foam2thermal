@@ -37,12 +37,17 @@ def _patch_stem(name: str, suffix_re: re.Pattern[str]) -> str:
     return suffix_re.sub("", name)
 
 
-def _is_ami_patch(name: str, ami_patterns: list[str]) -> bool:
+def is_ami_patch(name: str, ami_patterns: list[str]) -> bool:
+    """True if *name* matches configured AMI patch patterns."""
     base = re.sub(r"_\d+$", "", name)
     for pat in ami_patterns:
         if re.fullmatch(pat, base) or re.fullmatch(pat, name):
             return True
     return False
+
+
+def _is_ami_patch(name: str, ami_patterns: list[str]) -> bool:
+    return is_ami_patch(name, ami_patterns)
 
 
 def scan_cgns2foam_interfaces(

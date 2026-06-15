@@ -9,8 +9,9 @@ from pathlib import Path
 
 from .config import CaseConfig
 from .interfaces import InterfaceMethod, build_interface_list
-from .mesh import load_mesh, repair_cell_zones, validate_mesh_complete
-from .mesh_coalesce import coalesce_zone_interfaces
+from .mesh import load_mesh, repair_cell_zones, validate_mesh_complete, zone_bbox_centroid
+from .mesh_coalesce import coalesce_zone_interfaces, _write_binary_label_list
+from .mesh_split import field_patches_for_region, interface_neighbors
 from .templates import (
     control_dict,
     create_patch_ami,
@@ -23,6 +24,7 @@ from .templates import (
     fv_solution_fluid,
     fv_solution_solid,
     gravity_vector,
+    mrf_properties,
     region_properties,
     stitch_mesh_dict,
     thermophysical_fluid,
@@ -36,6 +38,64 @@ from .templates import (
 def _write(path: Path, content: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(content, encoding="utf-8", newline="\n")
+
+
+def _cell_to_region_header() -> bytes:
+    return (
+        b"FoamFile\n{\n    version 2.0;\n    format binary;\n"
+        b"    class labelList;\n    object cellToRegion;\n}\n\n"
+    )
+
+
+def _write_cell_to_region(out: Path, mesh, regions: list) -> None:
+    """Map each cell to a split-region index (fluid regions first, then solid)."""
+    import numpy as np
+
+    fluid = [r for r in regions if r.type == "fluid"]
+    solid = [r for r in regions if r.type == "solid"]
+    ordered = fluid + solid
+    zone_map: dict[str, int] = {}
+    for ri, reg in enumerate(ordered):
+        for z in reg.cell_zones:
+            zone_map[z] = ri
+
+    n_cells = max((max(z.cell_labels) for z in mesh.cell_zones if z.cell_labels), default=-1) + 1
+    cell_region = np.full(n_cells, -1, dtype=np.int32)
+    for z in mesh.cell_zones:
+        if z.name not in zone_map:
+            continue
+        ri = zone_map[z.name]
+        for c in z.cell_labels:
+            if 0 <= c < n_cells:
+                cell_region[c] = ri
+    if np.any(cell_region < 0):
+        missing = int(np.sum(cell_region < 0))
+        raise ValueError(f"{missing} cell(s) not assigned to any region in cellToRegion")
+
+    ctr = out / "constant" / "cellToRegion"
+    _write_binary_label_list(ctr, cell_region, _cell_to_region_header())
+
+
+def _ami_patterns(cfg: CaseConfig) -> list[str]:
+    return cfg.interfaces.get("ami_patterns", [r"ami_rot\d+"])
+
+
+def _mrf_non_rotating_patches(
+    patches: list[str],
+    ami_patterns: list[str],
+    rotating_zones: list[str],
+) -> list[str]:
+    from .interfaces import is_ami_patch
+
+    out: list[str] = []
+    for p in patches:
+        if is_ami_patch(p, ami_patterns):
+            out.append(p)
+        elif p == "open" or p.endswith("_1") and p.startswith("open"):
+            out.append(p)
+        elif "_to_" in p:
+            out.append(p)
+    return sorted(set(out))
 
 
 def _copy_mesh(source: Path, dest: Path, mesh_prep: dict) -> dict:
@@ -133,14 +193,17 @@ def generate_case(cfg: CaseConfig, *, dry_run: bool = False) -> dict:
     coalesce_report = _copy_mesh(cfg.source_case, out, cfg.mesh_prep)
     report["mesh_coalesce"] = coalesce_report
     mesh = load_mesh(out)
+    _write_cell_to_region(out, mesh, cfg.regions)
     _copy_system_for_prep(cfg.source_case, out)
-
-    # --- staged region configs (deployed after splitMeshRegions) ---
-    _write(out / "constant" / "g", gravity_vector(cfg.gravity))
     _write(
         out / "system" / "regionProperties",
         region_properties(cfg.fluid_regions, cfg.solid_regions),
     )
+    region_neighbors = interface_neighbors(out)
+    ami_pats = _ami_patterns(cfg)
+
+    # --- staged region configs (deployed after splitMeshRegions) ---
+    _write(out / "constant" / "g", gravity_vector(cfg.gravity))
     _write(
         out / "system" / "controlDict.cht",
         control_dict(cfg.numerics, cfg.solver),
@@ -152,6 +215,23 @@ def generate_case(cfg: CaseConfig, *, dry_run: bool = False) -> dict:
         if reg.type == "fluid":
             _write(cdir / "thermophysicalProperties", thermophysical_fluid(mat))
             _write(cdir / "turbulenceProperties", turbulence_properties(cfg.turbulence))
+            mrf = next((r.get("mrf") for r in cfg.raw["regions"] if r["name"] == reg.name), None)
+            if mrf:
+                rot_zones = mrf.get("cellZones", [])
+                axis = mrf.get("axis", cfg.interfaces.get("ami_rotation_axis", [0, 0, 1]))
+                omega = float(mrf.get("omega", 100))
+                origin_spec = mrf.get("origin", "centroid")
+                if origin_spec == "centroid":
+                    origin = zone_bbox_centroid(out / "constant" / "polyMesh", rot_zones)
+                else:
+                    origin = tuple(float(v) for v in origin_spec)
+                nr = mrf.get("nonRotatingPatches")
+                if nr is None:
+                    nr = _mrf_non_rotating_patches(mesh.patch_names, ami_pats, rot_zones)
+                _write(
+                    cdir / "MRFProperties",
+                    mrf_properties(rot_zones, origin, axis, omega, nr),
+                )
         else:
             _write(cdir / "thermophysicalProperties", thermophysical_solid(mat))
 
@@ -170,13 +250,19 @@ def generate_case(cfg: CaseConfig, *, dry_run: bool = False) -> dict:
 
     for reg in cfg.regions:
         rbc = cfg.boundary_conditions.get(reg.name, cfg.boundary_conditions.get(reg.foam_name, {}))
-        patches = mesh.patch_names
+        patches = field_patches_for_region(
+            reg.foam_name,
+            config_name=reg.name,
+            monolithic_patch_names=mesh.patch_names,
+            patch_region=patch_region,
+            neighbors=region_neighbors,
+        )
         odir = out / "0.orig" / reg.foam_name
-        _write(odir / "T", field_T(reg.type, patches, rbc.get("T", {}), T0))
-        _write(odir / "p", field_p(patches, p0))
+        _write(odir / "T", field_T(reg.type, patches, rbc.get("T", {}), T0, ami_patterns=ami_pats))
+        _write(odir / "p", field_p(patches, p0, ami_patterns=ami_pats))
         if reg.type == "fluid":
-            _write(odir / "U", field_U(patches, rbc.get("U", {}), U0))
-            _write(odir / "p_rgh", field_p_rgh(patches, 0))
+            _write(odir / "U", field_U(patches, rbc.get("U", {}), U0, ami_patterns=ami_pats))
+            _write(odir / "p_rgh", field_p_rgh(patches, 0, ami_patterns=ami_pats))
 
     ami_pairs = [
         (i.master, i.slave)
@@ -215,12 +301,22 @@ def generate_case(cfg: CaseConfig, *, dry_run: bool = False) -> dict:
     scripts_src = Path(__file__).resolve().parents[2] / "scripts"
     scripts_dst = out / "scripts"
     scripts_dst.mkdir(parents=True, exist_ok=True)
-    for name in ("relocateRegionMeshes.sh", "verifyRegions.sh", "split_regions.py"):
+    for name in (
+        "relocateRegionMeshes.sh",
+        "verifyRegions.sh",
+        "split_regions.py",
+        "fix_mapped_wall_patches.py",
+        "fix_cyclic_ami_patches.py",
+        "sync_region_fields.py",
+    ):
         src = scripts_src / name
         if src.is_file():
             shutil.copy2(src, scripts_dst / name)
 
     _write(out / "setup_report.json", json.dumps(report, indent=2))
+    meta = cfg.raw.setdefault("_meta", {})
+    meta["source_mesh"] = str(cfg.source_case)
+    _write(out / "config.json", json.dumps(cfg.raw, indent=2, ensure_ascii=False))
     _write(out / "Allrun.pre", _allrun_pre(cfg, interfaces, mesh, ami_on_mesh))
     _write(out / "Allrun", _allrun(cfg))
     _write(out / "Allclean", _allclean())
@@ -346,9 +442,6 @@ def _allrun_pre(cfg: CaseConfig, interfaces, mesh, ami_on_mesh: list[tuple[str, 
             "",
         ])
 
-    if ami_on_mesh and mesh_prep.get("create_ami_patches", False):
-        lines.append("runApplication -s createPatch createPatch -overwrite")
-
     lines.extend([
         "set +e",
         "runApplication -s checkMesh checkMesh -noTopology",
@@ -357,11 +450,32 @@ def _allrun_pre(cfg: CaseConfig, interfaces, mesh, ami_on_mesh: list[tuple[str, 
         'if [ "$CM" -ne 0 ]; then echo "WARNING: checkMesh exit $CM (see log.checkMesh.checkMesh)"; fi',
         "runApplication -s topoSet topoSet",
         "cp system/regionProperties constant/regionProperties",
+    ])
+
+    if ami_on_mesh and mesh_prep.get("create_ami_patches", True):
+        lines.extend([
+            "set +e",
+            "runApplication -s createPatch createPatch -overwrite",
+            "CP=$?",
+            "set -e",
+            'if [ "$CP" -ne 0 ]; then',
+            '    echo "WARNING: createPatch exit $CP (see log.createPatch.createPatch); fixing AMI after split"',
+            "fi",
+            "",
+        ])
+
+    lines.extend([
         "# splitMeshRegions crashes on Windows MinGW when writing regional meshes;",
         "# use foam2thermal Python splitter (same topology, CHT _to_ patches).",
         'FOAM2THERMAL_ROOT="$(cd "${0%/*}/../.." && pwd)"',
         'export PYTHONPATH="${FOAM2THERMAL_ROOT}/src:${PYTHONPATH}"',
-        'python "${0%/*}/scripts/split_regions.py" "$(pwd)"',
+        "if [ -f constant/polyMesh/boundary ]; then",
+        '  python "${0%/*}/scripts/split_regions.py" "$(pwd)"',
+        "else",
+        '  echo "Skipping split: monolithic polyMesh absent (regions already split)"',
+        "fi",
+        'python "${0%/*}/scripts/fix_cyclic_ami_patches.py" "$(pwd)"',
+        'python "${0%/*}/scripts/fix_mapped_wall_patches.py" "$(pwd)"',
         "sh scripts/verifyRegions.sh",
         "",
         "# Deploy per-region constant/system and CHT controlDict",
@@ -371,7 +485,12 @@ def _allrun_pre(cfg: CaseConfig, interfaces, mesh, ami_on_mesh: list[tuple[str, 
         '    cp -f system.orig/"${region}"/* "system/${region}/" 2>/dev/null || true',
         "done",
         "cp -f system/controlDict.cht system/controlDict",
+        'python "${0%/*}/scripts/sync_region_fields.py" "$(pwd)"',
+        "set +e",
         "runApplication -s renumberMesh renumberMesh -allRegions -overwrite",
+        "RN=$?",
+        "set -e",
+        'if [ "$RN" -ne 0 ]; then echo "WARNING: renumberMesh exit $RN (see log.renumberMesh.renumberMesh)"; fi',
         "",
         "restore0Dir -allRegions",
         "",
