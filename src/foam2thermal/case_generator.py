@@ -201,6 +201,9 @@ def generate_case(cfg: CaseConfig, *, dry_run: bool = False) -> dict:
     )
     region_neighbors = interface_neighbors(out)
     ami_pats = _ami_patterns(cfg)
+    T0 = cfg.initial.get("T", 300)
+    U0 = cfg.initial.get("U", [0, 0, 0])
+    p0 = cfg.initial.get("p", 101325)
 
     # --- staged region configs (deployed after splitMeshRegions) ---
     _write(out / "constant" / "g", gravity_vector(cfg.gravity))
@@ -222,15 +225,24 @@ def generate_case(cfg: CaseConfig, *, dry_run: bool = False) -> dict:
                 omega = float(mrf.get("omega", 100))
                 origin_spec = mrf.get("origin", "centroid")
                 if origin_spec == "centroid":
-                    origin = zone_bbox_centroid(out / "constant" / "polyMesh", rot_zones)
+                    if len(rot_zones) == 1:
+                        origins = [
+                            zone_bbox_centroid(out / "constant" / "polyMesh", rot_zones)
+                        ]
+                    else:
+                        origins = [
+                            zone_bbox_centroid(out / "constant" / "polyMesh", [z])
+                            for z in rot_zones
+                        ]
                 else:
-                    origin = tuple(float(v) for v in origin_spec)
+                    pt = tuple(float(v) for v in origin_spec)
+                    origins = [pt] * len(rot_zones)
                 nr = mrf.get("nonRotatingPatches")
                 if nr is None:
                     nr = _mrf_non_rotating_patches(mesh.patch_names, ami_pats, rot_zones)
                 _write(
                     cdir / "MRFProperties",
-                    mrf_properties(rot_zones, origin, axis, omega, nr),
+                    mrf_properties(rot_zones, origins, axis, omega, nr),
                 )
         else:
             _write(cdir / "thermophysicalProperties", thermophysical_solid(mat))
@@ -238,15 +250,10 @@ def generate_case(cfg: CaseConfig, *, dry_run: bool = False) -> dict:
         sdir = out / "system.orig" / reg.foam_name
         if reg.type == "fluid":
             _write(sdir / "fvSchemes", fv_schemes_fluid())
-            _write(sdir / "fvSolution", fv_solution_fluid(cfg.numerics))
+            _write(sdir / "fvSolution", fv_solution_fluid(cfg.numerics, p_ref=p0))
         else:
             _write(sdir / "fvSchemes", fv_schemes_solid())
             _write(sdir / "fvSolution", fv_solution_solid())
-
-    # --- 0.orig per region (used after splitMeshRegions) ---
-    T0 = cfg.initial.get("T", 300)
-    U0 = cfg.initial.get("U", [0, 0, 0])
-    p0 = cfg.initial.get("p", 101325)
 
     for reg in cfg.regions:
         rbc = cfg.boundary_conditions.get(reg.name, cfg.boundary_conditions.get(reg.foam_name, {}))
@@ -442,37 +449,48 @@ def _allrun_pre(cfg: CaseConfig, interfaces, mesh, ami_on_mesh: list[tuple[str, 
             "",
         ])
 
+    first_region = cfg.regions[0].foam_name if cfg.regions else "region0"
+
     lines.extend([
-        "set +e",
-        "runApplication -s checkMesh checkMesh -noTopology",
-        "CM=$?",
-        "set -e",
-        'if [ "$CM" -ne 0 ]; then echo "WARNING: checkMesh exit $CM (see log.checkMesh.checkMesh)"; fi',
-        "runApplication -s topoSet topoSet",
-        "cp system/regionProperties constant/regionProperties",
+        "# Monolithic-mesh steps (skip when regions already split)",
+        "if [ -f constant/polyMesh/boundary ]; then",
+        "    set +e",
+        "    runApplication -s checkMesh checkMesh -noTopology",
+        "    CM=$?",
+        "    set -e",
+        '    if [ "$CM" -ne 0 ]; then echo "WARNING: checkMesh exit $CM (see log.checkMesh.checkMesh)"; fi',
+        "    if [ -f constant/cellToRegion ]; then",
+        '        echo "Skipping topoSet: constant/cellToRegion present (from build)"',
+        "    else",
+        "        runApplication -s topoSet topoSet",
+        "    fi",
+        "    cp system/regionProperties constant/regionProperties",
     ])
 
     if ami_on_mesh and mesh_prep.get("create_ami_patches", True):
         lines.extend([
-            "set +e",
-            "runApplication -s createPatch createPatch -overwrite",
-            "CP=$?",
-            "set -e",
-            'if [ "$CP" -ne 0 ]; then',
-            '    echo "WARNING: createPatch exit $CP (see log.createPatch.createPatch); fixing AMI after split"',
-            "fi",
-            "",
+            "    set +e",
+            "    runApplication -s createPatch createPatch -overwrite",
+            "    CP=$?",
+            "    set -e",
+            '    if [ "$CP" -ne 0 ]; then',
+            '        echo "WARNING: createPatch exit $CP (see log.createPatch.createPatch); fixing AMI after split"',
+            "    fi",
         ])
 
     lines.extend([
-        "# splitMeshRegions crashes on Windows MinGW when writing regional meshes;",
-        "# use foam2thermal Python splitter (same topology, CHT _to_ patches).",
-        'FOAM2THERMAL_ROOT="$(cd "${0%/*}/../.." && pwd)"',
-        'export PYTHONPATH="${FOAM2THERMAL_ROOT}/src:${PYTHONPATH}"',
-        "if [ -f constant/polyMesh/boundary ]; then",
-        '  python "${0%/*}/scripts/split_regions.py" "$(pwd)"',
+        "    # splitMeshRegions crashes on Windows MinGW – use Python splitter.",
+        '    FOAM2THERMAL_ROOT="$(cd "${0%/*}/../.." && pwd)"',
+        '    export PYTHONPATH="${FOAM2THERMAL_ROOT}/src:${PYTHONPATH}"',
+        '    python "${0%/*}/scripts/split_regions.py" "$(pwd)"',
         "else",
-        '  echo "Skipping split: monolithic polyMesh absent (regions already split)"',
+        f'    if [ ! -f "constant/{first_region}/polyMesh/points" ]; then',
+        '        echo "ERROR: no monolithic or regional polyMesh – run setup_cht_case.py build first"',
+        "        exit 1",
+        "    fi",
+        '    echo "Skipping monolithic prep: constant/polyMesh absent (regions already split)"',
+        '    FOAM2THERMAL_ROOT="$(cd "${0%/*}/../.." && pwd)"',
+        '    export PYTHONPATH="${FOAM2THERMAL_ROOT}/src:${PYTHONPATH}"',
         "fi",
         'python "${0%/*}/scripts/fix_cyclic_ami_patches.py" "$(pwd)"',
         'python "${0%/*}/scripts/fix_mapped_wall_patches.py" "$(pwd)"',

@@ -10,17 +10,19 @@ from pathlib import Path
 import numpy as np
 
 from .mesh import (
+    CellZoneInfo,
     PatchInfo,
     mapped_wall_patch,
     parse_boundary,
     parse_cell_zones,
     write_boundary,
+    write_cell_zones_v2412,
 )
 from .mesh_coalesce import (
-    _read_ascii_face_list,
+    _read_faces,
     _read_binary_label_list,
     _read_binary_vector_field,
-    _write_ascii_face_list,
+    _write_binary_compact_face_list,
     _write_binary_label_list,
     _write_binary_vector_field,
 )
@@ -100,6 +102,26 @@ def _face_patch_map(patches: list[PatchInfo], n_faces: int) -> np.ndarray:
     return out
 
 
+def _region_cell_zones(
+    orig_zones: list[CellZoneInfo],
+    region_id: int,
+    cell_region: np.ndarray,
+    cell_map: dict[int, int],
+) -> list[CellZoneInfo]:
+    out: list[CellZoneInfo] = []
+    for z in orig_zones:
+        labels = sorted(
+            cell_map[int(c)]
+            for c in z.cell_labels
+            if 0 <= int(c) < cell_region.size
+            and int(cell_region[int(c)]) == region_id
+            and int(c) in cell_map
+        )
+        if labels:
+            out.append(CellZoneInfo(name=z.name, cell_labels=labels))
+    return out
+
+
 def _extract_region_mesh(
     region_id: int,
     region_name: str,
@@ -112,7 +134,17 @@ def _extract_region_mesh(
     patches: list[PatchInfo],
     face_patch: np.ndarray,
     cell_region: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, list[PatchInfo], int]:
+    orig_cell_zones: list[CellZoneInfo],
+) -> tuple[
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    list[PatchInfo],
+    int,
+    list[CellZoneInfo],
+]:
     n_faces = owner.size
     cell_mask = cell_region == region_id
     cells = np.where(cell_mask)[0]
@@ -218,7 +250,8 @@ def _extract_region_mesh(
 
     new_offsets[n_out] = pos
     new_conn = np.concatenate(new_conn_parts) if new_conn_parts else np.empty(0, dtype=np.int32)
-    return new_points, new_owner, new_nb, new_offsets, new_conn, final_patches, n_internal
+    region_zones = _region_cell_zones(orig_cell_zones, region_id, cell_region, cell_map)
+    return new_points, new_owner, new_nb, new_offsets, new_conn, final_patches, n_internal, region_zones
 
 
 def _write_region_poly(
@@ -230,11 +263,12 @@ def _write_region_poly(
     conn: np.ndarray,
     patches: list[PatchInfo],
     n_internal: int,
+    cell_zones: list[CellZoneInfo] | None = None,
 ) -> None:
     poly_dir.mkdir(parents=True, exist_ok=True)
     _write_binary_vector_field(poly_dir / "points", points, _default_header("vectorField", "points"))
-    _write_ascii_face_list(
-        poly_dir / "faces", offsets, conn, _default_header("faceList", "faces", fmt="ascii")
+    _write_binary_compact_face_list(
+        poly_dir / "faces", offsets, conn, _default_header("faceCompactList", "faces")
     )
     _write_binary_label_list(poly_dir / "owner", owner.astype(np.int32), _default_header("labelList", "owner"))
     _write_binary_label_list(
@@ -243,6 +277,8 @@ def _write_region_poly(
         _default_header("labelList", "neighbour"),
     )
     write_boundary(poly_dir / "boundary", patches, _default_boundary_header())
+    if cell_zones:
+        write_cell_zones_v2412(poly_dir / "cellZones", cell_zones)
 
 
 def interface_neighbors(case_dir: Path) -> dict[str, list[str]]:
@@ -288,7 +324,7 @@ def split_mesh_regions(case_dir: Path, region_names: list[str] | None = None) ->
     """Write constant/<region>/polyMesh for each region; remove monolithic polyMesh."""
     poly = case_dir / "constant" / "polyMesh"
     points = _read_binary_vector_field(poly / "points")
-    offsets, conn = _read_ascii_face_list(poly / "faces")
+    offsets, conn = _read_faces(poly / "faces")
     owner = _read_binary_label_list(poly / "owner")
     nb_raw = _read_binary_label_list(poly / "neighbour")
     patches = parse_boundary(poly / "boundary")
@@ -299,23 +335,36 @@ def split_mesh_regions(case_dir: Path, region_names: list[str] | None = None) ->
 
     n_cells = int(owner.max()) + 1
     cell_region, names = _cell_region_map(case_dir, poly, n_cells)
+    orig_cell_zones = parse_cell_zones(poly / "cellZones")
     if region_names:
         names = list(region_names)
 
     report: dict = {"regions": {}, "method": "python_split"}
     for ri, rname in enumerate(names):
         mesh = _extract_region_mesh(
-            ri, rname, names, points, offsets, conn, owner, nb, patches, face_patch, cell_region
+            ri,
+            rname,
+            names,
+            points,
+            offsets,
+            conn,
+            owner,
+            nb,
+            patches,
+            face_patch,
+            cell_region,
+            orig_cell_zones,
         )
         out_poly = case_dir / "constant" / rname / "polyMesh"
         if out_poly.exists():
             shutil.rmtree(out_poly)
-        _write_region_poly(out_poly, *mesh)
+        _write_region_poly(out_poly, *mesh[:7], mesh[7])
         report["regions"][rname] = {
             "cells": int(np.sum(cell_region == ri)),
             "faces": int(mesh[1].size),
             "internal_faces": mesh[6],
             "patches": len(mesh[5]),
+            "cell_zones": len(mesh[7]),
         }
 
     shutil.rmtree(poly)

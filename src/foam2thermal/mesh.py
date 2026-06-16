@@ -307,9 +307,9 @@ def zone_bbox_centroid(poly_dir: Path, zone_names: list[str]) -> tuple[float, fl
     import numpy as np
 
     from .mesh_coalesce import (
-        _read_ascii_face_list,
         _read_binary_label_list,
         _read_binary_vector_field,
+        _read_faces,
     )
 
     points = _read_binary_vector_field(poly_dir / "points")
@@ -323,7 +323,7 @@ def zone_bbox_centroid(poly_dir: Path, zone_names: list[str]) -> tuple[float, fl
         return (0.0, 0.0, 0.0)
 
     owner = _read_binary_label_list(poly_dir / "owner")
-    offsets, conn = _read_ascii_face_list(poly_dir / "faces")
+    offsets, conn = _read_faces(poly_dir / "faces")
     used_pts: set[int] = set()
     for fi, own in enumerate(owner):
         if int(own) not in cell_set:

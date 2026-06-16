@@ -61,6 +61,60 @@ def _read_ascii_face_list(path: Path) -> tuple[np.ndarray, np.ndarray]:
     return offsets, np.asarray(conn, dtype=np.int32)
 
 
+def _faces_format(path: Path) -> str:
+    raw = path.read_bytes()
+    m = re.search(rb"format\s+(\w+)\s*;", raw)
+    return m.group(1).decode("ascii") if m else "binary"
+
+
+def _repair_compact_offsets(ofs: np.ndarray, conn_len: int) -> np.ndarray:
+    """Fix non-monotonic offset entries from cgns2foam faceCompactList exports."""
+    out = ofs.copy()
+    i = 0
+    while i < len(out) - 1:
+        if int(out[i + 1]) > int(out[i]):
+            i += 1
+            continue
+        j = i + 2
+        while j < len(out) and int(out[j]) <= int(out[i]):
+            j += 1
+        if j >= len(out):
+            break
+        span = int(out[j]) - int(out[i])
+        gap = j - i
+        if gap <= 0 or span <= 0:
+            break
+        step = span // gap
+        for k in range(i + 1, j):
+            out[k] = int(out[i]) + step * (k - i)
+        i += 1
+    if int(out[-1]) != conn_len:
+        out[-1] = conn_len
+    return out
+
+
+def _read_binary_compact_face_list(path: Path) -> tuple[np.ndarray, np.ndarray]:
+    raw = path.read_bytes()
+    n_ofs, pos = _data_offset(raw)
+    ofs = np.frombuffer(raw, dtype="<i4", count=n_ofs, offset=pos).copy()
+    pos2 = pos + 4 * n_ofs
+    while pos2 < len(raw) and raw[pos2 : pos2 + 1] in b")\n\r\t ":
+        pos2 += 1
+    nl = raw.find(b"\n", pos2)
+    n_conn = int(raw[pos2:nl].decode().strip())
+    paren = raw.find(b"(", nl)
+    conn = np.frombuffer(raw, dtype="<i4", count=n_conn, offset=paren + 1).copy()
+    if ofs.size < 2 or not np.all(ofs[1:] >= ofs[:-1]) or int(ofs[-1]) != n_conn:
+        ofs = _repair_compact_offsets(ofs, n_conn)
+    return ofs, conn
+
+
+def _read_faces(path: Path) -> tuple[np.ndarray, np.ndarray]:
+    if _faces_format(path) == "ascii":
+        return _read_ascii_face_list(path)
+    return _read_binary_compact_face_list(path)
+
+
 def _merge_points(points: np.ndarray, tol: float) -> tuple[np.ndarray, np.ndarray]:
     """Return (merged_points, old_to_new map)."""
     if tol <= 0:
@@ -119,6 +173,21 @@ def _write_ascii_face_list(path: Path, offsets: np.ndarray, conn: np.ndarray, he
         fh.write(b")\n")
 
 
+def _write_binary_compact_face_list(
+    path: Path, offsets: np.ndarray, conn: np.ndarray, header: bytes
+) -> None:
+    ofs = np.ascontiguousarray(offsets, dtype=np.int32)
+    con = np.ascontiguousarray(conn, dtype=np.int32)
+    with open(path, "wb") as fh:
+        fh.write(header)
+        fh.write(f"{ofs.size}\n(".encode("ascii"))
+        fh.write(ofs.tobytes(order="C"))
+        fh.write(b")")
+        fh.write(f"{con.size}\n(".encode("ascii"))
+        fh.write(con.tobytes(order="C"))
+        fh.write(b")\n")
+
+
 def _write_binary_vector_field(path: Path, points: np.ndarray, header: bytes) -> None:
     arr = np.ascontiguousarray(points, dtype=np.float64)
     with open(path, "wb") as fh:
@@ -155,9 +224,10 @@ def _compact_mesh(
     pos = 0
     for mi, old_fi in enumerate(keep_old):
         s, e = int(offsets[old_fi]), int(offsets[old_fi + 1])
+        part = conn[s:e].copy()
         mid_offsets[mi] = pos
-        mid_conn_parts.append(conn[s:e].copy())
-        pos += e - s
+        mid_conn_parts.append(part)
+        pos += part.size
     mid_offsets[n_keep] = pos
     mid_conn = np.concatenate(mid_conn_parts) if mid_conn_parts else np.empty(0, dtype=np.int32)
     mid_owner = owner[keep_old]
@@ -180,33 +250,48 @@ def _compact_mesh(
     bnd_order: list[int] = []
     for p in patches:
         bnd_order.extend(bnd_by_patch.get(p.name, []))
+    included = set(int_order.tolist()) | set(bnd_order)
+    for mid_fi in bnd_ids:
+        mid_fi = int(mid_fi)
+        if mid_fi in included:
+            continue
+        pname = str(mid_patch[mid_fi])
+        bnd_by_patch.setdefault(pname, []).append(mid_fi)
+        bnd_order.append(mid_fi)
     final_order = np.concatenate([int_order, np.asarray(bnd_order, dtype=np.int32)])
+    n_final = int(final_order.size)
 
     final_owner = mid_owner[final_order]
     final_nb = mid_nb[final_order]
     n_internal = int(int_order.size)
 
-    final_offsets = np.zeros(n_keep + 1, dtype=np.int32)
+    final_offsets = np.zeros(n_final + 1, dtype=np.int32)
     final_conn_parts: list[np.ndarray] = []
     pos = 0
     for fi, mid_fi in enumerate(final_order):
         s, e = int(mid_offsets[mid_fi]), int(mid_offsets[mid_fi + 1])
+        part = mid_conn[s:e]
         final_offsets[fi] = pos
-        final_conn_parts.append(mid_conn[s:e])
-        pos += e - s
-    final_offsets[n_keep] = pos
+        final_conn_parts.append(part)
+        pos += part.size
+    final_offsets[n_final] = pos
     final_conn = np.concatenate(final_conn_parts) if final_conn_parts else np.empty(0, dtype=np.int32)
 
     final_patches: list[PatchInfo] = []
     cursor = n_internal
+    patch_names: list[str] = []
     for p in patches:
-        n_pf = len(bnd_by_patch.get(p.name, []))
-        if n_pf == 0:
-            continue
+        if bnd_by_patch.get(p.name):
+            patch_names.append(p.name)
+    for pname in bnd_by_patch:
+        if pname not in patch_names and bnd_by_patch[pname]:
+            patch_names.append(pname)
+    for pname in patch_names:
+        n_pf = len(bnd_by_patch[pname])
         final_patches.append(
             PatchInfo(
-                name=p.name,
-                patch_type=patch_type.get(p.name, "wall"),
+                name=pname,
+                patch_type=patch_type.get(pname, "wall"),
                 n_faces=n_pf,
                 start_face=cursor,
             )
@@ -236,7 +321,8 @@ def coalesce_zone_interfaces(
 
     n_points_before = _read_binary_vector_field(points_path).shape[0]
     points = _read_binary_vector_field(points_path)
-    offsets, conn = _read_ascii_face_list(faces_path)
+    faces_fmt = _faces_format(faces_path)
+    offsets, conn = _read_faces(faces_path)
     owner = _read_binary_label_list(owner_path).copy()
     neighbour_raw = _read_binary_label_list(neighbour_path)
     patches = parse_boundary(boundary_path)
@@ -311,7 +397,11 @@ def coalesce_zone_interfaces(
     )
 
     _write_binary_vector_field(points_path, points, _read_header_bytes(points_path))
-    _write_ascii_face_list(faces_path, final_offsets, final_conn, _read_header_bytes(faces_path))
+    faces_header = _read_header_bytes(faces_path)
+    if faces_fmt == "binary":
+        _write_binary_compact_face_list(faces_path, final_offsets, final_conn, faces_header)
+    else:
+        _write_ascii_face_list(faces_path, final_offsets, final_conn, faces_header)
     _write_binary_label_list(owner_path, final_owner.astype(np.int32), _read_header_bytes(owner_path))
     _write_binary_label_list(
         neighbour_path, final_nb[:n_internal].astype(np.int32), _read_header_bytes(neighbour_path)

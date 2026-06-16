@@ -268,8 +268,12 @@ snGradSchemes { default limited 0.33; }
     )
 
 
-def fv_solution_fluid(numerics: dict[str, Any]) -> str:
+def fv_solution_fluid(numerics: dict[str, Any], *, p_ref: float = 101325) -> str:
     n_nc = numerics.get("nNonOrthogonalCorrectors", 0)
+    p_ref_cell = numerics.get("pRefCell", 0)
+    p_ref_value = numerics.get("pRefValue", p_ref)
+    rho_min = numerics.get("rhoMin", 0.2)
+    rho_max = numerics.get("rhoMax", 2.0)
     return (
         foam_header("dictionary", "fvSolution", "system")
         + f"""
@@ -306,6 +310,10 @@ SIMPLE
     momentumPredictor true;
     nNonOrthogonalCorrectors {n_nc};
     frozenFlow      false;
+    pRefCell        {p_ref_cell};
+    pRefValue       {p_ref_value};
+    rhoMin          {rho_min};
+    rhoMax          {rho_max};
     residualControl {{ default 1e-7; }}
 }}
 
@@ -374,34 +382,37 @@ def _bc_block(name: str, spec: dict[str, Any], field: str) -> str:
 
 def mrf_properties(
     cell_zones: list[str],
-    origin: tuple[float, float, float],
+    origins: list[tuple[float, float, float]],
     axis: list[float],
     omega: float,
     non_rotating: list[str],
 ) -> str:
-    zones_s = " ".join(cell_zones)
-    nr = " ".join(non_rotating) if non_rotating else "()"
     if non_rotating:
+        nr = " ".join(non_rotating)
         nr_block = f"nonRotatingPatches ( {nr} );"
     else:
         nr_block = "nonRotatingPatches ();"
-    ox, oy, oz = origin
     ax, ay, az = axis
-    return (
-        foam_header("dictionary", "MRFProperties", "constant")
-        + f"""
-MRF
+    blocks: list[str] = []
+    for i, zone in enumerate(cell_zones):
+        ox, oy, oz = origins[i] if i < len(origins) else origins[0]
+        name = f"MRF{i + 1}" if len(cell_zones) > 1 else "MRF"
+        blocks.append(
+            f"""{name}
 {{
-    cellZones           ({zones_s});
+    cellZone            {zone};
     active              yes;
     {nr_block}
     origin              ({ox} {oy} {oz});
     axis                ({ax} {ay} {az});
     omega               {omega};
-}}
-
-// ************************************************************************* //
-"""
+}}"""
+        )
+    return (
+        foam_header("dictionary", "MRFProperties", "constant")
+        + "\n\n"
+        + "\n\n".join(blocks)
+        + "\n\n// ************************************************************************* //\n"
     )
 
 
@@ -437,7 +448,7 @@ def field_T(
         type            compressible::turbulentTemperatureRadCoupledMixed;
         Tnbr            T;
         kappaMethod     {kappa};
-        useImplicit     true;
+        useImplicit     false;
         qrNbr           none;
         qr              none;
         value           $internalField;
@@ -573,6 +584,23 @@ def field_p_rgh(
     for p in patches:
         if is_ami_patch(p, ami_patterns):
             blocks.append(f"    {p}\n{_cyclic_ami_bc('p_rgh')}")
+        elif p == "open":
+            blocks.append(
+                f"""    {p}
+    {{
+        type            totalPressure;
+        p0              uniform {p0};
+        value           $internalField;
+    }}"""
+            )
+        elif p.endswith("_1") and p.startswith("open"):
+            blocks.append(
+                f"""    {p}
+    {{
+        type            fixedValue;
+        value           $internalField;
+    }}"""
+            )
         else:
             blocks.append(
                 f"""    {p}
