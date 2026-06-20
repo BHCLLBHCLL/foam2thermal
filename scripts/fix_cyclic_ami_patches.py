@@ -84,16 +84,30 @@ def fix_case(case: Path) -> int:
         new_patches: list[PatchInfo] = []
 
         for p in patches:
-            if p.patch_type == "cyclicAMI":
-                new_patches.append(p)
-                continue
             neighbour = _partner(p.name, pairs)
+            needs_fix = False
             if (
                 p.patch_type == "wall"
                 and neighbour
                 and neighbour in names
                 and is_ami_patch(p.name, [r"ami_rot\d+"])
             ):
+                # Upgrade wall -> cyclicAMI
+                needs_fix = True
+            elif (
+                p.patch_type == "cyclicAMI"
+                and neighbour
+                and neighbour in names
+                and (
+                    not p.neighbour_patch
+                    or p.neighbour_patch in ("None", "none", "")
+                    or p.neighbour_patch != neighbour
+                )
+            ):
+                # Fix cyclicAMI with missing/wrong neighbourPatch
+                needs_fix = True
+
+            if needs_fix:
                 new_patches.append(
                     cyclic_ami_patch(
                         p.name,

@@ -41,8 +41,8 @@ def region_properties(fluid: list[str], solid: list[str]) -> str:
         + f"""
 regions
 (
-    solid ( {solid_s} )
     fluid ( {fluid_s} )
+    solid ( {solid_s} )
 );
 
 // ************************************************************************* //
@@ -271,7 +271,10 @@ snGradSchemes { default limited 0.33; }
 def fv_solution_fluid(numerics: dict[str, Any], *, p_ref: float = 101325) -> str:
     n_nc = numerics.get("nNonOrthogonalCorrectors", 0)
     p_ref_cell = numerics.get("pRefCell", 0)
-    p_ref_value = numerics.get("pRefValue", p_ref)
+    # p_rgh internalField is initialised to 0 (gauge pressure); the pressure
+    # reference must be consistent with that, otherwise the solver will try to
+    # pin p_rgh to 101325 in a cell that starts at 0 and diverge.
+    p_ref_value = numerics.get("pRefValue", 0)
     rho_min = numerics.get("rhoMin", 0.2)
     rho_max = numerics.get("rhoMax", 2.0)
     return (
@@ -289,11 +292,22 @@ solvers
 
     p_rgh
     {{
-        solver           PBiCGStab;
-        preconditioner   FDIC;
+        solver           GAMG;
+        smoother         GaussSeidel;
         tolerance        1e-7;
         relTol           0.01;
-        smoother         GaussSeidel;
+        maxIter          100;
+
+        cacheAgglomeration true;
+        nCellsInCoarsestLevel 200;
+        agglomerator    faceAreaPair;
+        mergeLevels     1;
+    }}
+
+    p_rghFinal
+    {{
+        $p_rgh;
+        relTol           0;
     }}
 
     "(U|k|h|epsilon|)"
@@ -458,13 +472,7 @@ def field_T(
             blocks.append(
                 f"""    {p}
     {{
-        type            externalWallHeatFluxTemperature;
-        kappaMethod     {kappa};
-        mode            coefficient;
-        Ta              $internalField;
-        h               uniform 0;
-        value           $internalField;
-        kappaName       none;
+        type            zeroGradient;
     }}"""
             )
 
@@ -500,6 +508,16 @@ def field_U(
             blocks.append(_bc_block(p, bc_cfg[p], "U"))
         elif is_ami_patch(p, ami_patterns):
             blocks.append(f"    {p}\n{_cyclic_ami_bc('U')}")
+        elif p.endswith("_1") and p.startswith("open"):
+            # Outlet -> pressureInletOutletVelocity lets flow leave freely and
+            # reverts to internalField on backflow.
+            blocks.append(
+                f"""    {p}
+    {{
+        type            pressureInletOutletVelocity;
+        value           $internalField;
+    }}"""
+            )
         elif "_to_" in p:
             blocks.append(
                 f"""    {p}
@@ -585,15 +603,17 @@ def field_p_rgh(
         if is_ami_patch(p, ami_patterns):
             blocks.append(f"    {p}\n{_cyclic_ami_bc('p_rgh')}")
         elif p == "open":
+            # Inlet with fixed velocity -> fixedFluxPressure so the pressure
+            # floats and the mass flux is driven by the U boundary.
             blocks.append(
                 f"""    {p}
     {{
-        type            totalPressure;
-        p0              uniform {p0};
+        type            fixedFluxPressure;
         value           $internalField;
     }}"""
             )
         elif p.endswith("_1") and p.startswith("open"):
+            # Outlet -> fixedValue pins the pressure reference (gauge = 0).
             blocks.append(
                 f"""    {p}
     {{

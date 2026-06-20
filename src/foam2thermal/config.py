@@ -17,9 +17,13 @@ class RegionDef:
 
     @property
     def foam_name(self) -> str:
-        """OpenFOAM region name after splitMeshRegions."""
-        if self.cell_zones:
-            return self.cell_zones[0]
+        """OpenFOAM region name after splitMeshRegions.
+
+        Uses the configured region name (self.name) so that region directories,
+        regionProperties and coupling patch names stay short and dot-free.
+        The Python splitter (split_regions.py) reads region names from
+        regionProperties, so this name propagates consistently.
+        """
         return self.name
 
 

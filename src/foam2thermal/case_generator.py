@@ -85,13 +85,19 @@ def _mrf_non_rotating_patches(
     ami_patterns: list[str],
     rotating_zones: list[str],
 ) -> list[str]:
+    """Patches on the rotating cellZone that should NOT rotate.
+
+    For a single MRF zone this is the set of AMI patches that belong to
+    *this* rotating zone plus any external boundary patches (open*).
+    Coupling patches (``*_to_*``) are added after split by the solver.
+    """
     from .interfaces import is_ami_patch
 
     out: list[str] = []
     for p in patches:
         if is_ami_patch(p, ami_patterns):
             out.append(p)
-        elif p == "open" or p.endswith("_1") and p.startswith("open"):
+        elif p == "open" or (p.startswith("open") and p.endswith("_1")):
             out.append(p)
         elif "_to_" in p:
             out.append(p)
@@ -128,15 +134,47 @@ def _copy_system_for_prep(source: Path, dest: Path) -> None:
 
 
 def _infer_patch_region(patch: str, cfg: CaseConfig) -> str | None:
+    """Infer which configured region a monolithic-mesh patch belongs to.
+
+    cgns2foam emits patches named ``<bc>`` / ``<bc>_1`` / ``<bc>_2`` …
+    for the same BC appearing in successive CGNS zones.  We strip the
+    trailing ``_<digit>`` suffix to get the base BC name, then map the
+    base name to a region using heuristics:
+      - ``ami_rot*`` / ``open*`` / ``impeller*`` → air (fluid)
+      - ``case1*`` → case1 (fluid)
+      - ``case2*`` → case2 (fluid)
+      - ``CU*`` / ``Cover*`` / ``fin1*`` / ``fin2*`` → matching solid
+    """
     if patch in cfg.patch_regions:
         return cfg.patch_regions[patch]
+
+    # Strip trailing _<digit> suffixes (e.g. case1_s_2 -> case1_s)
     base = re.sub(r"_\d+$", "", patch)
-    if base.endswith("_s") or base in ("CU", "Cover", "fin1", "fin2", "impeller2", "case1", "case2"):
-        for r in cfg.solid_regions:
-            return r
-    if "ami" in patch.lower() or patch.startswith("open"):
+
+    # AMI / open / impeller → air fluid region
+    if "ami" in base.lower() or base.startswith("open") or base.startswith("impeller"):
         for r in cfg.fluid_regions:
+            if r == "air":
+                return r
+        return cfg.fluid_regions[0] if cfg.fluid_regions else None
+
+    # case1 / case2 fan fluid regions
+    if base.startswith("case1"):
+        for r in cfg.fluid_regions:
+            if r == "case1":
+                return r
+    if base.startswith("case2"):
+        for r in cfg.fluid_regions:
+            if r == "case2":
+                return r
+
+    # Solid region inference by name prefix
+    for r in cfg.solid_regions:
+        # e.g. CU_s -> Cu, Cover_s -> Cover, fin1_s -> fin1, fin2_s -> fin2
+        rkey = r.lower()
+        if base.lower().startswith(rkey):
             return r
+
     return None
 
 
