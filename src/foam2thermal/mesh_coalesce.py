@@ -116,13 +116,39 @@ def _read_faces(path: Path) -> tuple[np.ndarray, np.ndarray]:
 
 
 def _merge_points(points: np.ndarray, tol: float) -> tuple[np.ndarray, np.ndarray]:
-    """Return (merged_points, old_to_new map)."""
+    """Return (merged_points, old_to_new map).
+
+    Groups points by their rounded grid cell (``round(p/tol)``) using a
+    collision-free packed key. Each group of points sharing the same grid
+    cell is merged into a single representative point.
+
+    Note: points up to ~2*tol apart can be merged if they straddle a grid
+    cell boundary, but points in different grid cells are never merged.
+    """
     if tol <= 0:
         return points, np.arange(len(points), dtype=np.int32)
     inv = np.round(points / tol).astype(np.int64)
-    keys = inv[:, 0] * 73856093 ^ inv[:, 1] * 19349663 ^ inv[:, 2] * 83492791
+    # Offset to non-negative so we can pack into a single 64-bit key without
+    # collisions. Each coordinate is shifted to [0, +inf) and packed as
+    # x * 2^42 + y * 2^21 + z, which is collision-free as long as each
+    # coordinate fits in 21 bits (range 0..2,097,151).
+    inv_offset = inv - inv.min(axis=0)
+    max_val = int(inv_offset.max())
+    if max_val < (1 << 21):
+        keys = inv_offset[:, 0].astype(np.int64) * (1 << 42) + inv_offset[:, 1].astype(np.int64) * (1 << 21) + inv_offset[:, 2].astype(np.int64)
+    else:
+        # Fall back to a structured-array key for very large grids.
+        dt = np.dtype([("x", np.int64), ("y", np.int64), ("z", np.int64)])
+        grid = np.empty(inv_offset.shape[0], dtype=dt)
+        grid["x"] = inv_offset[:, 0]
+        grid["y"] = inv_offset[:, 1]
+        grid["z"] = inv_offset[:, 2]
+        keys = grid
     order = np.argsort(keys, kind="mergesort")
-    keys_sorted = keys[order]
+    if isinstance(keys, np.ndarray):
+        keys_sorted = keys[order]
+    else:
+        keys_sorted = keys[order]
     _, first_idx = np.unique(keys_sorted, return_index=True)
     new_n = first_idx.size
     old_to_new = np.empty(len(points), dtype=np.int32)
@@ -346,14 +372,38 @@ def coalesce_zone_interfaces(
             if 0 <= c < n_cells:
                 cell_zone[c] = zi
 
-    points, pt_map = _merge_points(points, point_tol)
-    conn = pt_map[conn]
-
+    # Identify excluded (e.g. AMI) patch faces before point merging so we
+    # can restore their original vertices if global point merging collapses
+    # two vertices of the same face into one (creating a degenerate face).
     excluded_faces: set[int] = set()
+    excluded_face_orig_verts: dict[int, np.ndarray] = {}
     for p in patches:
         if _patch_excluded(p.name, exclude_re):
             for fi in range(p.start_face, min(p.start_face + p.n_faces, n_faces)):
                 excluded_faces.add(fi)
+                s, e = int(offsets[fi]), int(offsets[fi + 1])
+                excluded_face_orig_verts[fi] = conn[s:e].copy()
+
+    original_points = points.copy()
+    points, pt_map = _merge_points(points, point_tol)
+    conn = pt_map[conn]
+
+    # Restore degenerate faces on excluded patches by re-adding the original
+    # (pre-merge) points so each face keeps its distinct vertices.
+    extra_points: list[np.ndarray] = []
+    for fi, orig_verts in excluded_face_orig_verts.items():
+        s, e = int(offsets[fi]), int(offsets[fi + 1])
+        current_verts = conn[s:e]
+        if len(current_verts) != len(set(int(v) for v in current_verts)):
+            new_verts: list[int] = []
+            for ov in orig_verts:
+                new_idx = len(points) + len(extra_points)
+                extra_points.append(original_points[int(ov)])
+                new_verts.append(new_idx)
+            conn[s:e] = np.array(new_verts, dtype=conn.dtype)
+
+    if extra_points:
+        points = np.vstack([points, np.array(extra_points, dtype=np.float64)])
 
     key_to_faces: dict[tuple[int, ...], list[int]] = {}
     for fi in range(n_faces):
