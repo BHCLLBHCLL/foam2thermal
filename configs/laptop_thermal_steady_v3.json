@@ -1,5 +1,5 @@
 {
-  "_comment": "物性/区域/界面/数值配置。输入网格与输出目录由命令行指定，见 setup_cht_case.py --help",
+  "_comment": "v3 config: based on laptop_thermal_steady.json, adds CPU solid region for laptop_thermal_steady_scaled_v3_orig mesh",
 
   "openfoam": {
     "root": "C:/OF/v2412/msys64/home/ofuser/OpenFOAM/OpenFOAM-v2412",
@@ -11,8 +11,18 @@
     {
       "name": "air",
       "type": "fluid",
-      "cellZones": ["laptop_3d_geom.air.air_domain"],
-      "material": "air"
+      "cellZones": [
+        "laptop_3d_geom.air.air_domain",
+        "FPHPARTS.rotation1",
+        "FPHPARTS.rotation2"
+      ],
+      "material": "air",
+      "mrf": {
+        "cellZones": ["FPHPARTS.rotation1", "FPHPARTS.rotation2"],
+        "omega": 100,
+        "axis": [0, 0, 1],
+        "origin": "centroid"
+      }
     },
     {
       "name": "case1",
@@ -27,16 +37,10 @@
       "material": "air"
     },
     {
-      "name": "rot1",
-      "type": "fluid",
-      "cellZones": ["FPHPARTS.rotation1"],
-      "material": "air"
-    },
-    {
-      "name": "rot2",
-      "type": "fluid",
-      "cellZones": ["FPHPARTS.rotation2"],
-      "material": "air"
+      "name": "CPU",
+      "type": "solid",
+      "cellZones": ["laptop_3d_geom.solid_region.CPU"],
+      "material": "silicon"
     },
     {
       "name": "Cu",
@@ -68,8 +72,7 @@
     "air": "air",
     "case1": "air",
     "case2": "air",
-    "rot1": "air",
-    "rot2": "air",
+    "CPU": "silicon",
     "Cu": "aluminum",
     "Cover": "aluminum",
     "fin1": "aluminum",
@@ -109,6 +112,23 @@
         "transport": { "kappa": 202.4 },
         "equationOfState": { "rho": 2719 }
       }
+    },
+    "silicon": {
+      "thermoType": {
+        "type": "heSolidThermo",
+        "mixture": "pureMixture",
+        "transport": "constIso",
+        "thermo": "hConst",
+        "equationOfState": "rhoConst",
+        "specie": "specie",
+        "energy": "sensibleEnthalpy"
+      },
+      "mixture": {
+        "specie": { "nMoles": 1, "molWeight": 28.0855 },
+        "thermodynamics": { "Hf": 0, "Sf": 0, "Cp": 700 },
+        "transport": { "kappa": 130 },
+        "equationOfState": { "rho": 2329 }
+      }
     }
   },
 
@@ -124,15 +144,18 @@
 
   "patch_regions": {
     "open": "air",
-    "open_1": "air",
-    "ami_rot1": "rot1",
-    "ami_rot1_1": "rot2",
-    "ami_rot2": "rot1",
-    "ami_rot2_1": "rot2",
+    "ami_rot1": "air",
+    "ami_rot1_1": "air",
+    "ami_rot2": "air",
+    "ami_rot2_1": "air",
+    "impeller1_s": "air",
+    "impeller2_s": "air",
     "case1_s": "case1",
     "case1_s_1": "air",
     "case2_s": "case2",
     "case2_s_1": "air",
+    "CPU_s": "CPU",
+    "CPU_s_1": "air",
     "CU_s": "Cu",
     "CU_s_1": "air",
     "Cover_s": "Cover",
@@ -140,9 +163,7 @@
     "fin1_s": "fin1",
     "fin1_s_1": "air",
     "fin2_s": "fin2",
-    "fin2_s_1": "air",
-    "impeller2_s": "rot2",
-    "impeller2_s_1": "air"
+    "fin2_s_1": "air"
   },
 
   "initial_conditions": {
@@ -154,11 +175,21 @@
   "boundary_conditions": {
     "air": {
       "T": {
-        "open": { "type": "inletOutlet", "inletValue": "uniform 300", "value": "uniform 300" },
-        "open_1": { "type": "inletOutlet", "inletValue": "uniform 300", "value": "uniform 300" }
+        "open": { "type": "inletOutlet", "inletValue": "uniform 300", "value": "uniform 300" }
       },
       "U": {
         "open": { "type": "surfaceNormalFixedValue", "refValue": "uniform -0.5" }
+      }
+    },
+    "CPU": {
+      "T": {
+        "CPU_s": {
+          "type": "externalWallHeatFluxTemperature",
+          "mode": "power",
+          "Q": "uniform 20",
+          "kappaMethod": "solidThermo",
+          "value": "uniform 300"
+        }
       }
     },
     "Cu": {
@@ -185,14 +216,14 @@
   },
 
   "mesh_prep": {
-    "coalesce_interfaces": false,
+    "coalesce_interfaces": true,
     "coalesce_point_tol": 1.0e-4,
     "stitch_interfaces": false,
     "stitch_mode": "partial",
     "stitch_integral_ratio_max": 1.05,
     "stitch_partial_ratio_max": 3.0,
-    "coalesce_exclude_patterns": [],
-    "create_ami_patches": false,
+    "coalesce_exclude_patterns": ["ami_rot"],
+    "create_ami_patches": true,
     "stitch_tolerance": {
       "pointMergeTol": 0.1,
       "edgeMergeTol": 0.05

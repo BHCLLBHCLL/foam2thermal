@@ -226,21 +226,19 @@ def _read_binary_label_list(data: bytes, offset: int) -> tuple[list[int], int]:
 
 def parse_cell_zones(path: Path) -> list[CellZoneInfo]:
     raw = path.read_bytes()
-    text = raw.decode("utf-8", errors="replace")
-    body = _skip_foam_header(text)
 
     zones: list[CellZoneInfo] = []
+    # Search in raw bytes directly: positions from decoded text (with
+    # errors="replace") do not map back to byte offsets when the binary
+    # payload contains invalid UTF-8 sequences, which caused wrong cell
+    # counts to be read for zones following binary data.
     for m in re.finditer(
-        r"([^\s(\{\t\n]+)\s*\{\s*type\s+cellZone;\s*cellLabels\s+List<label>",
-        body,
+        rb"([^\s(\{\t\n]+)\s*\{\s*type\s+cellZone;\s*cellLabels\s+List<label>",
+        raw,
         flags=re.DOTALL,
     ):
-        name = m.group(1).strip()
-        marker = b"List<label>"
-        start = raw.find(marker, m.start())
-        if start < 0:
-            continue
-        pos = start + len(marker)
+        name = m.group(1).decode("ascii", errors="replace").strip()
+        pos = m.end()
         labels, _ = _read_binary_label_list(raw, pos)
         zones.append(CellZoneInfo(name=name, cell_labels=labels))
     return zones
