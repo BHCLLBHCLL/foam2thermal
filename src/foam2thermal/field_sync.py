@@ -59,7 +59,7 @@ def sync_region_fields(case_dir: Path) -> dict:
                 newline="\n",
             )
             (odir / "p_rgh").write_text(
-                field_p_rgh(patches, 0, ami_patterns=ami_pats),
+                field_p_rgh(patches, 0, bc_cfg=rbc.get("p_rgh", {}), ami_patterns=ami_pats),
                 encoding="utf-8",
                 newline="\n",
             )
