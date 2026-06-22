@@ -178,7 +178,10 @@
         "open": { "type": "inletOutlet", "inletValue": "uniform 300", "value": "uniform 300" }
       },
       "U": {
-        "open": { "type": "surfaceNormalFixedValue", "refValue": "uniform -0.5" }
+        "open": { "type": "pressureInletOutletVelocity", "value": "uniform (0 0 0)" }
+      },
+      "p_rgh": {
+        "open": { "type": "fixedValue", "value": "uniform 0" }
       }
     },
     "CPU": {

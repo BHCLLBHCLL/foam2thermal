@@ -595,12 +595,16 @@ def field_p_rgh(
     patches: list[str],
     p0: float,
     *,
+    bc_cfg: dict[str, Any] | None = None,
     ami_patterns: list[str] | None = None,
 ) -> str:
     blocks = ['     #includeEtc "caseDicts/setConstraintTypes"']
     ami_patterns = ami_patterns or [r"ami_rot\d+"]
+    bc_cfg = bc_cfg or {}
     for p in patches:
-        if is_ami_patch(p, ami_patterns):
+        if p in bc_cfg:
+            blocks.append(_bc_block(p, bc_cfg[p], "p_rgh"))
+        elif is_ami_patch(p, ami_patterns):
             blocks.append(f"    {p}\n{_cyclic_ami_bc('p_rgh')}")
         elif p == "open":
             # Inlet with fixed velocity -> fixedFluxPressure so the pressure

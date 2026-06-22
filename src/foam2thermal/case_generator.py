@@ -307,7 +307,7 @@ def generate_case(cfg: CaseConfig, *, dry_run: bool = False) -> dict:
         _write(odir / "p", field_p(patches, p0, ami_patterns=ami_pats))
         if reg.type == "fluid":
             _write(odir / "U", field_U(patches, rbc.get("U", {}), U0, ami_patterns=ami_pats))
-            _write(odir / "p_rgh", field_p_rgh(patches, 0, ami_patterns=ami_pats))
+            _write(odir / "p_rgh", field_p_rgh(patches, 0, bc_cfg=rbc.get("p_rgh", {}), ami_patterns=ami_pats))
 
     ami_pairs = [
         (i.master, i.slave)

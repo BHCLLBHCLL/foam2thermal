@@ -115,19 +115,50 @@ def _read_faces(path: Path) -> tuple[np.ndarray, np.ndarray]:
     return _read_binary_compact_face_list(path)
 
 
-def _merge_points(points: np.ndarray, tol: float) -> tuple[np.ndarray, np.ndarray]:
+def _merge_points(
+    points: np.ndarray,
+    tol: float,
+    *,
+    exclude: set[int] | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
     """Return (merged_points, old_to_new map).
 
     Groups points by their rounded grid cell (``round(p/tol)``) using a
     collision-free packed key. Each group of points sharing the same grid
     cell is merged into a single representative point.
 
+    Points in the ``exclude`` set are never merged with any other point;
+    they keep their own coordinates and are appended after the merged
+    points in the output array.
+
     Note: points up to ~2*tol apart can be merged if they straddle a grid
     cell boundary, but points in different grid cells are never merged.
     """
     if tol <= 0:
         return points, np.arange(len(points), dtype=np.int32)
-    inv = np.round(points / tol).astype(np.int64)
+
+    n = len(points)
+
+    # Determine which points are eligible for merging.
+    if exclude:
+        merge_mask = np.ones(n, dtype=bool)
+        for idx in exclude:
+            if 0 <= idx < n:
+                merge_mask[idx] = False
+        merge_indices = np.where(merge_mask)[0]
+        keep_indices = np.where(~merge_mask)[0]
+    else:
+        merge_mask = None
+        merge_indices = np.arange(n, dtype=np.int32)
+        keep_indices = np.empty(0, dtype=np.int32)
+
+    if merge_indices.size == 0:
+        # Nothing to merge – return original points unchanged.
+        return points, np.arange(n, dtype=np.int32)
+
+    # Merge only the eligible subset.
+    merge_pts = points[merge_indices]
+    inv = np.round(merge_pts / tol).astype(np.int64)
     # Offset to non-negative so we can pack into a single 64-bit key without
     # collisions. Each coordinate is shifted to [0, +inf) and packed as
     # x * 2^42 + y * 2^21 + z, which is collision-free as long as each
@@ -151,15 +182,30 @@ def _merge_points(points: np.ndarray, tol: float) -> tuple[np.ndarray, np.ndarra
         keys_sorted = keys[order]
     _, first_idx = np.unique(keys_sorted, return_index=True)
     new_n = first_idx.size
-    old_to_new = np.empty(len(points), dtype=np.int32)
-    new_points = np.empty((new_n, 3), dtype=np.float64)
+    merged_points = np.empty((new_n, 3), dtype=np.float64)
+    merge_to_new = np.empty(merge_indices.size, dtype=np.int32)
     for ui, start in enumerate(first_idx):
         end = first_idx[ui + 1] if ui + 1 < first_idx.size else order.size
         members = order[start:end]
         rep = int(members[0])
-        new_points[ui] = points[rep]
-        old_to_new[members] = ui
-    return new_points, old_to_new
+        merged_points[ui] = merge_pts[rep]
+        merge_to_new[members] = ui
+
+    # Build the final points array: [merged_points, kept_points].
+    final_n = new_n + keep_indices.size
+    final_points = np.empty((final_n, 3), dtype=np.float64)
+    final_old_to_new = np.empty(n, dtype=np.int32)
+
+    final_points[:new_n] = merged_points
+    for i, old_idx in enumerate(merge_indices):
+        final_old_to_new[old_idx] = merge_to_new[i]
+
+    if keep_indices.size > 0:
+        final_points[new_n:] = points[keep_indices]
+        for i, old_idx in enumerate(keep_indices):
+            final_old_to_new[old_idx] = new_n + i
+
+    return final_points, final_old_to_new
 
 
 def _face_vertex_key(offsets: np.ndarray, conn: np.ndarray, fi: int) -> tuple[int, ...] | None:
@@ -384,8 +430,27 @@ def coalesce_zone_interfaces(
                 s, e = int(offsets[fi]), int(offsets[fi + 1])
                 excluded_face_orig_verts[fi] = conn[s:e].copy()
 
+    # Collect all vertex indices referenced by excluded (AMI) faces.
+    # These vertices are excluded from the global point merge so that the
+    # smooth cylindrical AMI surface is preserved.  Only non-AMI vertices
+    # (interface faces, internal faces) participate in the merge.
+    excluded_vert_ids: set[int] = set()
+    for fi in excluded_faces:
+        s, e = int(offsets[fi]), int(offsets[fi + 1])
+        excluded_vert_ids.update(int(v) for v in conn[s:e])
+
+    # Save original connectivity for ALL faces so we can restore any face
+    # that becomes degenerate (has repeated vertices) after point merging.
+    # This prevents zero-area faces and zero-volume cells that would crash
+    # the solver.  Interface faces that become degenerate would not pair
+    # correctly anyway, so restoring them is safe.
+    all_face_orig_verts: list[np.ndarray] = [None] * n_faces
+    for fi in range(n_faces):
+        s, e = int(offsets[fi]), int(offsets[fi + 1])
+        all_face_orig_verts[fi] = conn[s:e].copy()
+
     original_points = points.copy()
-    points, pt_map = _merge_points(points, point_tol)
+    points, pt_map = _merge_points(points, point_tol, exclude=excluded_vert_ids)
     conn = pt_map[conn]
 
     # Restore degenerate faces on excluded patches by re-adding the original
@@ -395,6 +460,24 @@ def coalesce_zone_interfaces(
         s, e = int(offsets[fi]), int(offsets[fi + 1])
         current_verts = conn[s:e]
         if len(current_verts) != len(set(int(v) for v in current_verts)):
+            new_verts: list[int] = []
+            for ov in orig_verts:
+                new_idx = len(points) + len(extra_points)
+                extra_points.append(original_points[int(ov)])
+                new_verts.append(new_idx)
+            conn[s:e] = np.array(new_verts, dtype=conn.dtype)
+
+    # Also restore any other face that became degenerate after point merging.
+    # This catches internal faces and non-excluded boundary faces whose
+    # vertices were collapsed by the global point merge.  Without this,
+    # zero-area faces produce NaN residuals in the solver.
+    for fi in range(n_faces):
+        if fi in excluded_face_orig_verts:
+            continue  # already handled above
+        s, e = int(offsets[fi]), int(offsets[fi + 1])
+        current_verts = conn[s:e]
+        if len(current_verts) != len(set(int(v) for v in current_verts)):
+            orig_verts = all_face_orig_verts[fi]
             new_verts: list[int] = []
             for ov in orig_verts:
                 new_idx = len(points) + len(extra_points)
