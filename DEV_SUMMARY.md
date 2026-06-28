@@ -338,9 +338,9 @@ chtMultiRegionSimpleFoam.exe > log.chtMultiRegionSimpleFoam 2>&1
 | 模块 | 缺口 |
 |------|------|
 | **稳态求解** | `fvSolution` 已补 `pRefCell`/`pRefValue`；Windows MinGW 上首步迭代仍可能 exit 3（无 FATAL 静默崩溃） |
-| **界面合并** | 默认 Python coalesce；`stitchMesh` 可选但默认关闭；仍有未配对界面 → 开放单元 |
-| **湍流** | 默认 laminar；RAS 需手动补 `k`/`epsilon`/`nut`/`alphat` 场（教程级流体区均有） |
-| **辐射** | 未生成 `radiationProperties` |
+| **界面合并** | 默认 Python coalesce；新增几何兜底配对（`coalesce_geometric_fallback`，按面心重合 + 顶点吸附）减少开放单元；`stitchMesh` 仍可选且默认关闭 |
+| **湍流** | 默认 laminar；设 `turbulence.simulationType=RAS` 时自动生成各流体区 `k`/`epsilon`/`nut`/`alphat` 场（壁函数边界） |
+| **辐射** | 各区生成 `radiationProperties`（默认 `radiationModel none`，消除运行时提示，可经 `radiation` 配置启用） |
 | **瞬态 CHT** | 仅 `chtMultiRegionSimpleFoam`，无 `chtMultiRegionFoam` |
 | **CGNS 直读** | 依赖外部 cgns2foam |
 | **自动化测试** | 无单元/回归测试；靠 log 与手工验证 |
@@ -435,13 +435,13 @@ chtMultiRegionSimpleFoam.exe > log.chtMultiRegionSimpleFoam 2>&1
 
 ### 仍待解决
 
-1. **网格开放单元**：约 29,789 个开放单元（未配对界面面），产生质量泄漏，Time=2 连续性误差仍高（~7499）。需提高 coalesce 配对完整率。
+1. **网格开放单元**：未配对界面面会产生质量泄漏。已新增几何兜底配对（`mesh_prep.coalesce_geometric_fallback`，默认开启，容差 `coalesce_geom_tol` 默认 `5 × coalesce_point_tol`），对"几何重合但点未被合并"的界面面按面心重合 + 顶点吸附补配；`setup_report.json` 的 `mesh_coalesce` 增加 `paired_signature`/`paired_geometric`/`suspected_unpaired_interface_faces` 以便观测剩余开放面。仍需在真实网格上核对配对完整率。
 
 2. **Windows 求解器 exit 3**：`chtMultiRegionSimpleFoam` 在 `Time=1` 求解 U 后静默退出（无 FATAL）；`FOAM_SIGFPE=0` 无效。建议在 **WSL2/Linux** 求解，或 `frozenFlow true` 做纯传热调试。
 
 3. **Allrun.pre 复制失败**：MSYS2 bash 中 `cp -f constant.orig/*` 偶发无法覆盖，需改为 Windows 兼容复制（Python/PowerShell）。
 
-4. **momentumPredictor false**（v3 配置）：降低初期动量收敛速度；稳定后（约 50 步）可改回 `true`。
+4. **momentumPredictor false**（v3 配置）：降低初期动量收敛速度；稳定后（约 50 步）可改回 `true`。v3 已将 `frozenFlow` 由 `true` 改为 `false`（真正求解流场对流），并加回 `limitTemperature [200,500]` 作为温度安全网。
 
 5. **高非正交网格**：最大非正交性 ~84°，严重非正交面 ~1,391；需网格优化或增大 `nNonOrthogonalCorrectors`。
 

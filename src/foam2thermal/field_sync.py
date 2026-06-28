@@ -7,7 +7,16 @@ from pathlib import Path
 
 from .config import load_config
 from .mesh import parse_boundary
-from .templates import field_p, field_p_rgh, field_T, field_U
+from .templates import (
+    field_alphat,
+    field_epsilon,
+    field_k,
+    field_nut,
+    field_p,
+    field_p_rgh,
+    field_T,
+    field_U,
+)
 
 
 def sync_region_fields(case_dir: Path) -> dict:
@@ -25,7 +34,10 @@ def sync_region_fields(case_dir: Path) -> dict:
     T0 = cfg.initial.get("T", 300)
     U0 = cfg.initial.get("U", [0, 0, 0])
     p0 = cfg.initial.get("p", 101325)
+    k0 = cfg.initial.get("k", 0.1)
+    eps0 = cfg.initial.get("epsilon", 0.01)
     ami_pats = cfg.interfaces.get("ami_patterns", [r"ami_rot\d+"])
+    ras = str(cfg.turbulence.get("simulationType", "laminar")).lower() not in ("laminar", "")
 
     by_foam = {r.foam_name: r for r in cfg.regions}
     report: dict[str, list[str]] = {}
@@ -63,5 +75,26 @@ def sync_region_fields(case_dir: Path) -> dict:
                 encoding="utf-8",
                 newline="\n",
             )
+            if ras:
+                (odir / "k").write_text(
+                    field_k(patches, rbc.get("k", {}), k0, ami_patterns=ami_pats),
+                    encoding="utf-8",
+                    newline="\n",
+                )
+                (odir / "epsilon").write_text(
+                    field_epsilon(patches, rbc.get("epsilon", {}), eps0, ami_patterns=ami_pats),
+                    encoding="utf-8",
+                    newline="\n",
+                )
+                (odir / "nut").write_text(
+                    field_nut(patches, rbc.get("nut", {}), ami_patterns=ami_pats),
+                    encoding="utf-8",
+                    newline="\n",
+                )
+                (odir / "alphat").write_text(
+                    field_alphat(patches, rbc.get("alphat", {}), ami_patterns=ami_pats),
+                    encoding="utf-8",
+                    newline="\n",
+                )
 
     return {"regions": report}

@@ -217,7 +217,11 @@
     "deltaT": 1,
     "nNonOrthogonalCorrectors": 2,
     "momentumPredictor": false,
-    "frozenFlow": true,
+    "frozenFlow": false,
+    "limitTemperature": {
+      "min": 200,
+      "max": 500
+    },
     "relaxation": {
       "p_rgh": 0.3,
       "U": 0.3,
@@ -228,6 +232,8 @@
   "mesh_prep": {
     "coalesce_interfaces": true,
     "coalesce_point_tol": 1.0e-4,
+    "coalesce_geometric_fallback": true,
+    "coalesce_geom_tol": 5.0e-4,
     "stitch_interfaces": false,
     "stitch_mode": "partial",
     "stitch_integral_ratio_max": 1.05,

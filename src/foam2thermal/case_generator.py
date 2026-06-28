@@ -16,6 +16,10 @@ from .templates import (
     control_dict,
     create_patch_ami,
     decompose_par_dict,
+    field_alphat,
+    field_epsilon,
+    field_k,
+    field_nut,
     field_p,
     field_p_rgh,
     field_T,
@@ -27,6 +31,7 @@ from .templates import (
     fv_solution_solid,
     gravity_vector,
     mrf_properties,
+    radiation_properties,
     region_properties,
     stitch_mesh_dict,
     thermophysical_fluid,
@@ -106,6 +111,33 @@ def _mrf_non_rotating_patches(
     return sorted(set(out))
 
 
+def _is_ras(cfg: CaseConfig) -> bool:
+    """True when the configured turbulence model needs k/epsilon/nut/alphat fields."""
+    sim = str(cfg.turbulence.get("simulationType", "laminar")).lower()
+    return sim not in ("laminar", "")
+
+
+def _radiation_model_for(cfg: CaseConfig, region_name: str, foam_name: str) -> str:
+    """Resolve the radiationModel name for a region (default 'none').
+
+    Config hook (all optional)::
+
+        "radiation": "none"                      # global model name, or
+        "radiation": { "default": "none",        # global default + overrides
+                       "air": "fvDOM" }
+    """
+    rad = cfg.raw.get("radiation")
+    if isinstance(rad, str):
+        return rad
+    if isinstance(rad, dict):
+        for key in (region_name, foam_name):
+            if key in rad:
+                return str(rad[key])
+        if "default" in rad:
+            return str(rad["default"])
+    return "none"
+
+
 def _default_mrf_axis_for_zone(zone_name: str) -> list[float]:
     """Default MRF rotation axis from cellZone name (cgns2foam FPHPARTS.rotation*)."""
     name = zone_name.lower()
@@ -143,10 +175,13 @@ def _copy_mesh(source: Path, dest: Path, mesh_prep: dict) -> dict:
     coalesce_report: dict = {"paired_faces": 0}
     if mesh_prep.get("coalesce_interfaces", True):
         tol = float(mesh_prep.get("coalesce_point_tol", 1e-4))
+        geom_tol = mesh_prep.get("coalesce_geom_tol")
         coalesce_report = coalesce_zone_interfaces(
             dst_poly,
             point_tol=tol,
             exclude_patterns=mesh_prep.get("coalesce_exclude_patterns", [r"ami_rot"]),
+            geometric_fallback=mesh_prep.get("coalesce_geometric_fallback", True),
+            geom_tol=float(geom_tol) if geom_tol is not None else None,
         )
     return coalesce_report
 
@@ -283,9 +318,17 @@ def generate_case(cfg: CaseConfig, *, dry_run: bool = False) -> dict:
         decompose_par_dict(cfg.n_procs),
     )
 
+    ras = _is_ras(cfg)
+    k0 = cfg.initial.get("k", 0.1)
+    eps0 = cfg.initial.get("epsilon", 0.01)
+
     for reg in cfg.regions:
         mat = cfg.material_for(reg.foam_name)
         cdir = out / "constant.orig" / reg.foam_name
+        _write(
+            cdir / "radiationProperties",
+            radiation_properties(_radiation_model_for(cfg, reg.name, reg.foam_name)),
+        )
         if reg.type == "fluid":
             _write(cdir / "thermophysicalProperties", thermophysical_fluid(mat))
             _write(cdir / "turbulenceProperties", turbulence_properties(cfg.turbulence))
@@ -345,6 +388,11 @@ def generate_case(cfg: CaseConfig, *, dry_run: bool = False) -> dict:
         if reg.type == "fluid":
             _write(odir / "U", field_U(patches, rbc.get("U", {}), U0, ami_patterns=ami_pats))
             _write(odir / "p_rgh", field_p_rgh(patches, 0, bc_cfg=rbc.get("p_rgh", {}), ami_patterns=ami_pats))
+            if ras:
+                _write(odir / "k", field_k(patches, rbc.get("k", {}), k0, ami_patterns=ami_pats))
+                _write(odir / "epsilon", field_epsilon(patches, rbc.get("epsilon", {}), eps0, ami_patterns=ami_pats))
+                _write(odir / "nut", field_nut(patches, rbc.get("nut", {}), ami_patterns=ami_pats))
+                _write(odir / "alphat", field_alphat(patches, rbc.get("alphat", {}), ami_patterns=ami_pats))
 
     ami_pairs = [
         (i.master, i.slave)

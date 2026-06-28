@@ -219,9 +219,11 @@ prep 完成后：
 | `materials` | 流体/固体热物性 |
 | `interfaces` | AMI patch 配对、`ami_rotation_axis` |
 | `patch_regions` | 单体网格 patch → 逻辑区域映射 |
-| `boundary_conditions` | 按区域覆盖默认 BC |
-| `numerics` | endTime、writeInterval、deltaT 等 |
-| `mesh_prep` | coalesce、AMI、split 选项 |
+| `boundary_conditions` | 按区域覆盖默认 BC（含 `k`/`epsilon`/`nut`/`alphat`） |
+| `turbulence` | `simulationType laminar`（默认）或 `RAS` + `RASModel`；设 RAS 时自动生成各流体区 `k`/`epsilon`/`nut`/`alphat` 场 |
+| `radiation` | 可选；字符串模型名或 `{ "default": "none", "<region>": "fvDOM" }`，缺省各区写 `radiationModel none` |
+| `numerics` | `endTime`/`writeInterval`/`deltaT`/`relaxation`；`frozenFlow`（冻结流场只解能量）、`limitTemperature {min,max}`（生成 `fvOptions` 温度限值） |
+| `mesh_prep` | coalesce、AMI、split 选项；`coalesce_geometric_fallback`（默认 true）+ `coalesce_geom_tol`（默认 `5×coalesce_point_tol`）几何兜底配对，减少开放单元 |
 
 **cyclicAMI 与 MRF：**
 

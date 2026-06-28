@@ -700,6 +700,247 @@ boundaryField
     )
 
 
+def _is_open_inlet(p: str) -> bool:
+    return p == "open" or (p.startswith("open") and not p.endswith("_1"))
+
+
+def _is_open_outlet(p: str) -> bool:
+    return p.startswith("open") and p.endswith("_1")
+
+
+def field_k(
+    patches: list[str],
+    bc_cfg: dict[str, Any],
+    k0: float,
+    *,
+    ami_patterns: list[str] | None = None,
+) -> str:
+    """Turbulent kinetic energy field (RAS)."""
+    blocks = ['     #includeEtc "caseDicts/setConstraintTypes"']
+    ami_patterns = ami_patterns or [r"ami_rot\d+"]
+    for p in patches:
+        if p in bc_cfg:
+            blocks.append(_bc_block(p, bc_cfg[p], "k"))
+        elif is_ami_patch(p, ami_patterns):
+            blocks.append(f"    {p}\n{_cyclic_ami_bc('k')}")
+        elif _is_open_outlet(p):
+            blocks.append(
+                f"""    {p}
+    {{
+        type            inletOutlet;
+        inletValue      uniform {k0};
+        value           uniform {k0};
+    }}"""
+            )
+        elif _is_open_inlet(p):
+            blocks.append(
+                f"""    {p}
+    {{
+        type            fixedValue;
+        value           uniform {k0};
+    }}"""
+            )
+        else:
+            blocks.append(
+                f"""    {p}
+    {{
+        type            kqRWallFunction;
+        value           uniform {k0};
+    }}"""
+            )
+    return (
+        foam_header("volScalarField", "k", "0")
+        + f"""
+dimensions      [0 2 -2 0 0 0 0];
+internalField   uniform {k0};
+
+boundaryField
+{{
+{chr(10).join(blocks)}
+}}
+
+// ************************************************************************* //
+"""
+    )
+
+
+def field_epsilon(
+    patches: list[str],
+    bc_cfg: dict[str, Any],
+    eps0: float,
+    *,
+    ami_patterns: list[str] | None = None,
+) -> str:
+    """Turbulent dissipation field (RAS kEpsilon)."""
+    blocks = ['     #includeEtc "caseDicts/setConstraintTypes"']
+    ami_patterns = ami_patterns or [r"ami_rot\d+"]
+    for p in patches:
+        if p in bc_cfg:
+            blocks.append(_bc_block(p, bc_cfg[p], "epsilon"))
+        elif is_ami_patch(p, ami_patterns):
+            blocks.append(f"    {p}\n{_cyclic_ami_bc('epsilon')}")
+        elif _is_open_outlet(p):
+            blocks.append(
+                f"""    {p}
+    {{
+        type            inletOutlet;
+        inletValue      uniform {eps0};
+        value           uniform {eps0};
+    }}"""
+            )
+        elif _is_open_inlet(p):
+            blocks.append(
+                f"""    {p}
+    {{
+        type            fixedValue;
+        value           uniform {eps0};
+    }}"""
+            )
+        else:
+            blocks.append(
+                f"""    {p}
+    {{
+        type            epsilonWallFunction;
+        value           uniform {eps0};
+    }}"""
+            )
+    return (
+        foam_header("volScalarField", "epsilon", "0")
+        + f"""
+dimensions      [0 2 -3 0 0 0 0];
+internalField   uniform {eps0};
+
+boundaryField
+{{
+{chr(10).join(blocks)}
+}}
+
+// ************************************************************************* //
+"""
+    )
+
+
+def field_nut(
+    patches: list[str],
+    bc_cfg: dict[str, Any],
+    *,
+    ami_patterns: list[str] | None = None,
+) -> str:
+    """Turbulent viscosity field (RAS); wall-function / calculated boundaries."""
+    blocks = ['     #includeEtc "caseDicts/setConstraintTypes"']
+    ami_patterns = ami_patterns or [r"ami_rot\d+"]
+    for p in patches:
+        if p in bc_cfg:
+            blocks.append(_bc_block(p, bc_cfg[p], "nut"))
+        elif is_ami_patch(p, ami_patterns):
+            blocks.append(f"    {p}\n{_cyclic_ami_bc('nut')}")
+        elif _is_open_inlet(p) or _is_open_outlet(p):
+            blocks.append(
+                f"""    {p}
+    {{
+        type            calculated;
+        value           uniform 0;
+    }}"""
+            )
+        else:
+            blocks.append(
+                f"""    {p}
+    {{
+        type            nutkWallFunction;
+        value           uniform 0;
+    }}"""
+            )
+    return (
+        foam_header("volScalarField", "nut", "0")
+        + f"""
+dimensions      [0 2 -1 0 0 0 0];
+internalField   uniform 0;
+
+boundaryField
+{{
+{chr(10).join(blocks)}
+}}
+
+// ************************************************************************* //
+"""
+    )
+
+
+def field_alphat(
+    patches: list[str],
+    bc_cfg: dict[str, Any],
+    *,
+    prt: float = 0.85,
+    ami_patterns: list[str] | None = None,
+) -> str:
+    """Turbulent thermal diffusivity field (compressible RAS)."""
+    blocks = ['     #includeEtc "caseDicts/setConstraintTypes"']
+    ami_patterns = ami_patterns or [r"ami_rot\d+"]
+    for p in patches:
+        if p in bc_cfg:
+            blocks.append(_bc_block(p, bc_cfg[p], "alphat"))
+        elif is_ami_patch(p, ami_patterns):
+            blocks.append(f"    {p}\n{_cyclic_ami_bc('alphat')}")
+        elif _is_open_inlet(p) or _is_open_outlet(p):
+            blocks.append(
+                f"""    {p}
+    {{
+        type            calculated;
+        value           uniform 0;
+    }}"""
+            )
+        else:
+            blocks.append(
+                f"""    {p}
+    {{
+        type            compressible::alphatWallFunction;
+        Prt             {prt};
+        value           uniform 0;
+    }}"""
+            )
+    return (
+        foam_header("volScalarField", "alphat", "0")
+        + f"""
+dimensions      [1 -1 -1 0 0 0 0];
+internalField   uniform 0;
+
+boundaryField
+{{
+{chr(10).join(blocks)}
+}}
+
+// ************************************************************************* //
+"""
+    )
+
+
+def radiation_properties(model: str = "none") -> str:
+    """Per-region radiationProperties.
+
+    ``model == "none"`` writes an inactive dictionary so the solver does not
+    emit the "radiationProperties not found" notice and a radiation model can
+    be enabled later by editing this file.
+    """
+    active = "off" if model == "none" else "on"
+    body = f"""
+radiation       {active};
+
+radiationModel  {model};
+"""
+    if model != "none":
+        body += """
+// Define the model coefficients below, e.g. for opaqueSolid / fvDOM / viewFactor.
+// absorptionEmissionModel none;
+// scatterModel    none;
+// sootModel       none;
+"""
+    return (
+        foam_header("dictionary", "radiationProperties", "constant")
+        + body
+        + "\n// ************************************************************************* //\n"
+    )
+
+
 def create_patch_ami(
     pairs: list[tuple[str, str]],
     rot_axis: list[float] | None = None,
