@@ -23,7 +23,15 @@ from .case_generator import generate_case
 from .config import load_config
 from .interfaces import scan_cgns2foam_interfaces
 from .mesh import load_mesh, validate_mesh_complete
-from .runner import openfoam_run_failed, run_allrun_pre, run_solver
+from .runner import (
+    openfoam_run_failed,
+    reconstruct_complete,
+    run_allrun_pre,
+    run_reconstruct_parallel,
+    run_solver,
+    solver_reached_time,
+    tail_solver_log,
+)
 
 EPILOG = """
 positional arguments (all subcommands):
@@ -137,15 +145,45 @@ def _cmd_run(args: argparse.Namespace) -> int:
             return 1
 
     if args.step in ("all", "solve"):
-        print(f"Running solver in {output_case} ...")
-        result = run_solver(cfg.bash_exe, cfg.openfoam_root, output_case, solver=cfg.solver)
+        parallel = (args.parallel or cfg.n_procs > 1) and not args.serial
+        mode = f"parallel ({cfg.n_procs} procs)" if parallel else "serial"
+        print(f"Running solver in {output_case} [{mode}] ...")
+        result = run_solver(
+            cfg.bash_exe,
+            cfg.openfoam_root,
+            output_case,
+            solver=cfg.solver,
+            parallel=parallel,
+            n_procs=cfg.n_procs,
+            reconstruct=parallel and not args.no_reconstruct,
+        )
         if result.stdout:
             print(result.stdout)
         if result.stderr:
             print(result.stderr, file=sys.stderr)
         if openfoam_run_failed(result):
             print("Solver run failed – see log.* in output case.", file=sys.stderr)
+            tail = tail_solver_log(output_case, solver=cfg.solver)
+            if tail:
+                print("\n--- log tail ---\n" + tail, file=sys.stderr)
             return 1
+        target = int(cfg.numerics.get("endTime", 200))
+        if not solver_reached_time(output_case, target, solver=cfg.solver):
+            print(
+                f"Solver finished but log does not show Time={target} – check log.{cfg.solver}",
+                file=sys.stderr,
+            )
+            tail = tail_solver_log(output_case, solver=cfg.solver)
+            if tail:
+                print("\n--- log tail ---\n" + tail, file=sys.stderr)
+            return 1
+        print(f"Solver reached Time={target} successfully.")
+        if parallel and not args.no_reconstruct:
+            region_names = [r.foam_name for r in cfg.regions]
+            if reconstruct_complete(output_case, region_names):
+                print("Parallel reconstruction complete (fields merged to case root).")
+            else:
+                print("Warning: reconstructPar may have failed – check log.reconstructPar*", file=sys.stderr)
 
     return 0
 
@@ -198,6 +236,21 @@ def main(argv: list[str] | None = None) -> int:
         choices=("all", "prep", "solve"),
         default="all",
         help="prep=Allrun.pre only, solve=solver only, all=both (default)",
+    )
+    p_run.add_argument(
+        "--parallel",
+        action="store_true",
+        help="run decomposePar + runParallel (default when openfoam.nProcs > 1)",
+    )
+    p_run.add_argument(
+        "--serial",
+        action="store_true",
+        help="force serial runApplication even if nProcs > 1",
+    )
+    p_run.add_argument(
+        "--no-reconstruct",
+        action="store_true",
+        help="skip reconstructParMesh/reconstructPar after parallel solve",
     )
     p_run.set_defaults(func=_cmd_run)
 

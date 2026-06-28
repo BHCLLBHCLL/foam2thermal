@@ -189,7 +189,7 @@ application     {solver};
 startFrom       startTime;
 startTime       0;
 stopAt          endTime;
-endTime         {numerics.get('endTime', 500)};
+endTime         {numerics.get('endTime', 200)};
 
 deltaT          {numerics.get('deltaT', 1)};
 
@@ -268,8 +268,62 @@ snGradSchemes { default limited 0.33; }
     )
 
 
+def _relaxation_block(numerics: dict[str, Any]) -> str:
+    rel = numerics.get("relaxation", {})
+    p_rgh = rel.get("p_rgh", 0.7)
+    u = rel.get("U", 0.4)
+    h = rel.get("h", 0.9)
+    k = rel.get("k", 0.7)
+    eps = rel.get("epsilon", 0.7)
+    return f"""relaxationFactors
+{{
+    fields {{ p_rgh {p_rgh}; rho 1; }}
+    equations {{ U {u}; h {h}; k {k}; epsilon {eps}; }}
+}}
+"""
+
+
+def fv_options_limit_temperature(numerics: dict[str, Any]) -> str | None:
+    lim = numerics.get("limitTemperature")
+    if not lim:
+        return None
+    t_min = lim.get("min", 200)
+    t_max = lim.get("max", 500)
+    return (
+        foam_header("dictionary", "fvOptions", "system")
+        + f"""
+limitT
+{{
+    type            limitTemperature;
+    active          yes;
+    selectionMode   all;
+    min             {t_min};
+    max             {t_max};
+}}
+
+// ************************************************************************* //
+"""
+    )
+
+
+def decompose_par_dict(n_procs: int, *, location: str = "") -> str:
+    loc = location or "system"
+    return (
+        foam_header("dictionary", "decomposeParDict", loc)
+        + f"""
+numberOfSubdomains  {n_procs};
+
+method          scotch;
+
+// ************************************************************************* //
+"""
+    )
+
+
 def fv_solution_fluid(numerics: dict[str, Any], *, p_ref: float = 101325) -> str:
     n_nc = numerics.get("nNonOrthogonalCorrectors", 0)
+    momentum = "true" if numerics.get("momentumPredictor", True) else "false"
+    frozen = "true" if numerics.get("frozenFlow", False) else "false"
     p_ref_cell = numerics.get("pRefCell", 0)
     # p_rgh internalField is initialised to 0 (gauge pressure); the pressure
     # reference must be consistent with that, otherwise the solver will try to
@@ -321,9 +375,9 @@ solvers
 
 SIMPLE
 {{
-    momentumPredictor true;
+    momentumPredictor {momentum};
     nNonOrthogonalCorrectors {n_nc};
-    frozenFlow      false;
+    frozenFlow      {frozen};
     pRefCell        {p_ref_cell};
     pRefValue       {p_ref_value};
     rhoMin          {rho_min};
@@ -331,12 +385,9 @@ SIMPLE
     residualControl {{ default 1e-7; }}
 }}
 
-relaxationFactors
-{{
-    fields {{ p_rgh 0.7; rho 1; }}
-    equations {{ U 0.4; h 0.9; k 0.7; epsilon 0.7; }}
-}}
-
+"""
+        + _relaxation_block(numerics)
+        + """
 // ************************************************************************* //
 """
     )
@@ -397,7 +448,7 @@ def _bc_block(name: str, spec: dict[str, Any], field: str) -> str:
 def mrf_properties(
     cell_zones: list[str],
     origins: list[tuple[float, float, float]],
-    axis: list[float],
+    axes: list[list[float]],
     omega: float,
     non_rotating: list[str],
 ) -> str:
@@ -406,10 +457,10 @@ def mrf_properties(
         nr_block = f"nonRotatingPatches ( {nr} );"
     else:
         nr_block = "nonRotatingPatches ();"
-    ax, ay, az = axis
     blocks: list[str] = []
     for i, zone in enumerate(cell_zones):
         ox, oy, oz = origins[i] if i < len(origins) else origins[0]
+        ax, ay, az = axes[i] if i < len(axes) else axes[0]
         name = f"MRF{i + 1}" if len(cell_zones) > 1 else "MRF"
         blocks.append(
             f"""{name}

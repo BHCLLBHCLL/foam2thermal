@@ -4,7 +4,8 @@
   "openfoam": {
     "root": "C:/OF/v2412/msys64/home/ofuser/OpenFOAM/OpenFOAM-v2412",
     "bash": "C:/OF/v2412/msys64/usr/bin/bash.exe",
-    "solver": "chtMultiRegionSimpleFoam"
+    "solver": "chtMultiRegionSimpleFoam",
+    "nProcs": 8
   },
 
   "regions": [
@@ -20,7 +21,6 @@
       "mrf": {
         "cellZones": ["FPHPARTS.rotation1", "FPHPARTS.rotation2"],
         "omega": 100,
-        "axis": [0, 0, 1],
         "origin": "centroid"
       }
     },
@@ -212,10 +212,17 @@
   "gravity": [0, 0, -9.81],
 
   "numerics": {
-    "endTime": 500,
+    "endTime": 200,
     "writeInterval": 50,
     "deltaT": 1,
-    "nNonOrthogonalCorrectors": 0
+    "nNonOrthogonalCorrectors": 2,
+    "momentumPredictor": false,
+    "frozenFlow": true,
+    "relaxation": {
+      "p_rgh": 0.3,
+      "U": 0.3,
+      "h": 0.3
+    }
   },
 
   "mesh_prep": {

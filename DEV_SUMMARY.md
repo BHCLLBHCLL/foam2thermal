@@ -228,7 +228,7 @@ MRF1
     active              yes;
     nonRotatingPatches  ( ami_rot1 ami_rot1_1 ami_rot2 ami_rot2_1 open open_1 );
     origin              (-67.8 -2.999 80.986);
-    axis                (0 0 1);
+    axis                (0 1 0);
     omega               100.0;
 }
 
@@ -236,11 +236,11 @@ MRF2
 {
     cellZone            FPHPARTS.rotation2;
     ...
-}
+    axis                (0 -1 0);
 ```
 
 - `nonRotatingPatches` 必须包含所有 AMI 面和开放边界
-- `axis` 必须与风扇旋转轴一致（本案例为 z 轴）
+- 默认转轴：`rotation1` → `(0 1 0)`，`rotation2` → `(0 -1 0)`；其他 cellZone 回退 `(0 0 1)`
 - `origin` 默认按各 rotation cellZone 几何中心分别计算
 
 ### 6.2 Allrun.pre 复制问题（Windows）

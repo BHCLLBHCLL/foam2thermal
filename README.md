@@ -215,7 +215,7 @@ prep 完成后：
 | `openfoam.root` / `bash` | OpenFOAM 安装路径、MSYS2 bash |
 | `openfoam.solver` | 求解器名，默认 `chtMultiRegionSimpleFoam` |
 | `regions` | 区域名、类型（fluid/solid）、cellZones、材料 |
-| `regions[].mrf` | MRF 旋转区：`cellZones`、`omega`（rad/s）、`axis`、`origin` |
+| `regions[].mrf` | MRF 旋转区：`cellZones`、`omega`（rad/s）、`axis`/`axes`、`origin` |
 | `materials` | 流体/固体热物性 |
 | `interfaces` | AMI patch 配对、`ami_rotation_axis` |
 | `patch_regions` | 单体网格 patch → 逻辑区域映射 |
@@ -228,6 +228,7 @@ prep 完成后：
 - AMI 界面（`ami_rot*`）须在**同一 fluid region** 的 polyMesh 上，因此旋转 cellZone 与 air 域合并
 - 场 BC 中 AMI patch 使用 `type cyclicAMI`
 - 旋转体效应由 `constant/<region>/MRFProperties` 定义（`omega` 单位为 **rad/s**）
+- 默认转轴：`rotation1` → `(0 1 0)`，`rotation2` → `(0 -1 0)`（按 cellZone 名匹配）；可用 `mrf.axis`（统一）或 `mrf.axes`（按 zone 覆盖）
 
 ---
 

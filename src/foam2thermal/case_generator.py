@@ -15,10 +15,12 @@ from .mesh_split import field_patches_for_region, interface_neighbors
 from .templates import (
     control_dict,
     create_patch_ami,
+    decompose_par_dict,
     field_p,
     field_p_rgh,
     field_T,
     field_U,
+    fv_options_limit_temperature,
     fv_schemes_fluid,
     fv_schemes_solid,
     fv_solution_fluid,
@@ -102,6 +104,33 @@ def _mrf_non_rotating_patches(
         elif "_to_" in p:
             out.append(p)
     return sorted(set(out))
+
+
+def _default_mrf_axis_for_zone(zone_name: str) -> list[float]:
+    """Default MRF rotation axis from cellZone name (cgns2foam FPHPARTS.rotation*)."""
+    name = zone_name.lower()
+    if "rotation2" in name:
+        return [0.0, -1.0, 0.0]
+    if "rotation1" in name:
+        return [0.0, 1.0, 0.0]
+    return [0.0, 0.0, 1.0]
+
+
+def _mrf_axes(rot_zones: list[str], mrf: dict) -> list[list[float]]:
+    """Resolve per-zone MRF axes (mrf.axes dict/list, mrf.axis, or name defaults)."""
+    if "axes" in mrf:
+        cfg = mrf["axes"]
+        if isinstance(cfg, dict):
+            return [
+                [float(v) for v in cfg.get(z, _default_mrf_axis_for_zone(z))]
+                for z in rot_zones
+            ]
+        if isinstance(cfg, list) and len(cfg) == len(rot_zones):
+            return [[float(c) for c in ax] for ax in cfg]
+    if "axis" in mrf:
+        ax = [float(v) for v in mrf["axis"]]
+        return [ax] * len(rot_zones)
+    return [_default_mrf_axis_for_zone(z) for z in rot_zones]
 
 
 def _copy_mesh(source: Path, dest: Path, mesh_prep: dict) -> dict:
@@ -249,6 +278,10 @@ def generate_case(cfg: CaseConfig, *, dry_run: bool = False) -> dict:
         out / "system" / "controlDict.cht",
         control_dict(cfg.numerics, cfg.solver),
     )
+    _write(
+        out / "system" / "decomposeParDict",
+        decompose_par_dict(cfg.n_procs),
+    )
 
     for reg in cfg.regions:
         mat = cfg.material_for(reg.foam_name)
@@ -259,7 +292,7 @@ def generate_case(cfg: CaseConfig, *, dry_run: bool = False) -> dict:
             mrf = next((r.get("mrf") for r in cfg.raw["regions"] if r["name"] == reg.name), None)
             if mrf:
                 rot_zones = mrf.get("cellZones", [])
-                axis = mrf.get("axis", cfg.interfaces.get("ami_rotation_axis", [0, 0, 1]))
+                axes = _mrf_axes(rot_zones, mrf)
                 omega = float(mrf.get("omega", 100))
                 origin_spec = mrf.get("origin", "centroid")
                 if origin_spec == "centroid":
@@ -280,15 +313,19 @@ def generate_case(cfg: CaseConfig, *, dry_run: bool = False) -> dict:
                     nr = _mrf_non_rotating_patches(mesh.patch_names, ami_pats, rot_zones)
                 _write(
                     cdir / "MRFProperties",
-                    mrf_properties(rot_zones, origins, axis, omega, nr),
+                    mrf_properties(rot_zones, origins, axes, omega, nr),
                 )
         else:
             _write(cdir / "thermophysicalProperties", thermophysical_solid(mat))
 
         sdir = out / "system.orig" / reg.foam_name
+        _write(sdir / "decomposeParDict", decompose_par_dict(cfg.n_procs, location="system"))
         if reg.type == "fluid":
             _write(sdir / "fvSchemes", fv_schemes_fluid())
             _write(sdir / "fvSolution", fv_solution_fluid(cfg.numerics, p_ref=p0))
+            fv_opt = fv_options_limit_temperature(cfg.numerics)
+            if fv_opt:
+                _write(sdir / "fvOptions", fv_opt)
         else:
             _write(sdir / "fvSchemes", fv_schemes_solid())
             _write(sdir / "fvSolution", fv_solution_solid())
@@ -573,6 +610,7 @@ def _allrun_pre(cfg: CaseConfig, interfaces, mesh, ami_on_mesh: list[tuple[str, 
 
 
 def _allrun(cfg: CaseConfig) -> str:
+    n_procs = cfg.n_procs
     return "\n".join([
         "#!/bin/sh",
         "set -e",
@@ -580,7 +618,14 @@ def _allrun(cfg: CaseConfig) -> str:
         ". ${WM_PROJECT_DIR:?}/bin/tools/RunFunctions",
         "#------------------------------------------------------------------------------",
         "./Allrun.pre",
-        "runApplication $(getApplication)",
+        "",
+        "# Decompose and run in parallel",
+        f"runApplication -o -s decomposePar decomposePar -allRegions -copyZero -force",
+        f"runParallel -o -np {n_procs} $(getApplication)",
+        "",
+        "# Merge processor* data back to case root (all regions)",
+        "runApplication -o -s reconstructParMesh reconstructParMesh -allRegions -constant",
+        "runApplication -o -s reconstructPar reconstructPar -allRegions",
         "#------------------------------------------------------------------------------",
         "",
     ])

@@ -35,6 +35,7 @@ class CaseConfig:
     openfoam_root: Path
     bash_exe: Path
     solver: str
+    n_procs: int
     regions: list[RegionDef]
     region_materials: dict[str, str]
     materials: dict[str, Any]
@@ -107,6 +108,7 @@ def load_config(
         openfoam_root=Path(of["root"]),
         bash_exe=Path(of.get("bash", r"C:\OF\v2412\msys64\usr\bin\bash.exe")),
         solver=of.get("solver", "chtMultiRegionSimpleFoam"),
+        n_procs=int(of.get("nProcs", 8)),
         regions=regions,
         region_materials=region_materials,
         materials=raw.get("materials", {}),
