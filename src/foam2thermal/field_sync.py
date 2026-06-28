@@ -47,7 +47,9 @@ def sync_region_fields(case_dir: Path) -> dict:
         reg = by_foam.get(region)
         if not reg:
             continue
-        patches = [p.name for p in parse_boundary(bnd_path)]
+        parsed = parse_boundary(bnd_path)
+        patches = [p.name for p in parsed]
+        patch_types = {p.name: p.patch_type for p in parsed}
         report[region] = patches
 
         rbc = cfg.boundary_conditions.get(reg.name, cfg.boundary_conditions.get(reg.foam_name, {}))
@@ -77,22 +79,22 @@ def sync_region_fields(case_dir: Path) -> dict:
             )
             if ras:
                 (odir / "k").write_text(
-                    field_k(patches, rbc.get("k", {}), k0, ami_patterns=ami_pats),
+                    field_k(patches, rbc.get("k", {}), k0, ami_patterns=ami_pats, patch_types=patch_types),
                     encoding="utf-8",
                     newline="\n",
                 )
                 (odir / "epsilon").write_text(
-                    field_epsilon(patches, rbc.get("epsilon", {}), eps0, ami_patterns=ami_pats),
+                    field_epsilon(patches, rbc.get("epsilon", {}), eps0, ami_patterns=ami_pats, patch_types=patch_types),
                     encoding="utf-8",
                     newline="\n",
                 )
                 (odir / "nut").write_text(
-                    field_nut(patches, rbc.get("nut", {}), ami_patterns=ami_pats),
+                    field_nut(patches, rbc.get("nut", {}), ami_patterns=ami_pats, patch_types=patch_types),
                     encoding="utf-8",
                     newline="\n",
                 )
                 (odir / "alphat").write_text(
-                    field_alphat(patches, rbc.get("alphat", {}), ami_patterns=ami_pats),
+                    field_alphat(patches, rbc.get("alphat", {}), ami_patterns=ami_pats, patch_types=patch_types),
                     encoding="utf-8",
                     newline="\n",
                 )

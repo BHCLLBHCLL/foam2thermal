@@ -321,6 +321,7 @@ def generate_case(cfg: CaseConfig, *, dry_run: bool = False) -> dict:
     ras = _is_ras(cfg)
     k0 = cfg.initial.get("k", 0.1)
     eps0 = cfg.initial.get("epsilon", 0.01)
+    patch_types = {p.name: p.patch_type for p in mesh.patches}
 
     for reg in cfg.regions:
         mat = cfg.material_for(reg.foam_name)
@@ -389,10 +390,10 @@ def generate_case(cfg: CaseConfig, *, dry_run: bool = False) -> dict:
             _write(odir / "U", field_U(patches, rbc.get("U", {}), U0, ami_patterns=ami_pats))
             _write(odir / "p_rgh", field_p_rgh(patches, 0, bc_cfg=rbc.get("p_rgh", {}), ami_patterns=ami_pats))
             if ras:
-                _write(odir / "k", field_k(patches, rbc.get("k", {}), k0, ami_patterns=ami_pats))
-                _write(odir / "epsilon", field_epsilon(patches, rbc.get("epsilon", {}), eps0, ami_patterns=ami_pats))
-                _write(odir / "nut", field_nut(patches, rbc.get("nut", {}), ami_patterns=ami_pats))
-                _write(odir / "alphat", field_alphat(patches, rbc.get("alphat", {}), ami_patterns=ami_pats))
+                _write(odir / "k", field_k(patches, rbc.get("k", {}), k0, ami_patterns=ami_pats, patch_types=patch_types))
+                _write(odir / "epsilon", field_epsilon(patches, rbc.get("epsilon", {}), eps0, ami_patterns=ami_pats, patch_types=patch_types))
+                _write(odir / "nut", field_nut(patches, rbc.get("nut", {}), ami_patterns=ami_pats, patch_types=patch_types))
+                _write(odir / "alphat", field_alphat(patches, rbc.get("alphat", {}), ami_patterns=ami_pats, patch_types=patch_types))
 
     ami_pairs = [
         (i.master, i.slave)
@@ -545,6 +546,9 @@ def _allrun_pre(cfg: CaseConfig, interfaces, mesh, ami_on_mesh: list[tuple[str, 
         "export FOAM_SIGFPE=0 FOAM_SETNAN=0",
         'cd "${0%/*}" || exit',
         ". ${WM_PROJECT_DIR:?}/bin/tools/RunFunctions",
+        "# Prefer python3 (many Linux installs have no bare 'python' shim).",
+        'PYTHON="${PYTHON:-$(command -v python3 || command -v python)}"',
+        'if [ -z "$PYTHON" ]; then echo "ERROR: no python3/python on PATH"; exit 1; fi',
         "#------------------------------------------------------------------------------",
         "# foam2thermal – mesh prep (monolithic mesh, no constant/<region> yet)",
         "",
@@ -605,7 +609,7 @@ def _allrun_pre(cfg: CaseConfig, interfaces, mesh, ami_on_mesh: list[tuple[str, 
         "    # splitMeshRegions crashes on Windows MinGW – use Python splitter.",
         '    FOAM2THERMAL_ROOT="$(cd "${0%/*}/../.." && pwd)"',
         '    export PYTHONPATH="${FOAM2THERMAL_ROOT}/src:${PYTHONPATH}"',
-        '    python "${0%/*}/scripts/split_regions.py" "$(pwd)"',
+        '    "$PYTHON" "${0%/*}/scripts/split_regions.py" "$(pwd)"',
         "else",
         f'    if [ ! -f "constant/{first_region}/polyMesh/points" ]; then',
         '        echo "ERROR: no monolithic or regional polyMesh – run setup_cht_case.py build first"',
@@ -615,8 +619,8 @@ def _allrun_pre(cfg: CaseConfig, interfaces, mesh, ami_on_mesh: list[tuple[str, 
         '    FOAM2THERMAL_ROOT="$(cd "${0%/*}/../.." && pwd)"',
         '    export PYTHONPATH="${FOAM2THERMAL_ROOT}/src:${PYTHONPATH}"',
         "fi",
-        'python "${0%/*}/scripts/fix_cyclic_ami_patches.py" "$(pwd)"',
-        'python "${0%/*}/scripts/fix_mapped_wall_patches.py" "$(pwd)"',
+        '"$PYTHON" "${0%/*}/scripts/fix_cyclic_ami_patches.py" "$(pwd)"',
+        '"$PYTHON" "${0%/*}/scripts/fix_mapped_wall_patches.py" "$(pwd)"',
         "sh scripts/verifyRegions.sh",
         "",
         "# Deploy per-region constant/system and CHT controlDict",
@@ -635,7 +639,7 @@ def _allrun_pre(cfg: CaseConfig, interfaces, mesh, ami_on_mesh: list[tuple[str, 
         "else",
         '    echo "FOAM2THERMAL_KEEP_SETTINGS=1: preserving existing system/constant settings"',
         "fi",
-        'python "${0%/*}/scripts/sync_region_fields.py" "$(pwd)"',
+        '"$PYTHON" "${0%/*}/scripts/sync_region_fields.py" "$(pwd)"',
         "set +e",
         "runApplication -s renumberMesh renumberMesh -allRegions -overwrite",
         "RN=$?",

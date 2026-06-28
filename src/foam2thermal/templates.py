@@ -708,12 +708,27 @@ def _is_open_outlet(p: str) -> bool:
     return p.startswith("open") and p.endswith("_1")
 
 
+def _wall_like(p: str, patch_types: dict[str, str] | None) -> bool:
+    """True when *p* may carry a wall function (wall / mappedWall patch).
+
+    Wall-function BCs FATAL on non-wall (``patch``) boundaries, so when patch
+    types are known we only apply them to wall-like patches and fall back to a
+    safe non-wall BC otherwise.  With no type info we assume wall (the common
+    cgns2foam case) to preserve previous behaviour.
+    """
+    if not patch_types:
+        return True
+    t = patch_types.get(p)
+    return t is None or t in ("wall", "mappedWall")
+
+
 def field_k(
     patches: list[str],
     bc_cfg: dict[str, Any],
     k0: float,
     *,
     ami_patterns: list[str] | None = None,
+    patch_types: dict[str, str] | None = None,
 ) -> str:
     """Turbulent kinetic energy field (RAS)."""
     blocks = ['     #includeEtc "caseDicts/setConstraintTypes"']
@@ -740,12 +755,19 @@ def field_k(
         value           uniform {k0};
     }}"""
             )
-        else:
+        elif _wall_like(p, patch_types):
             blocks.append(
                 f"""    {p}
     {{
         type            kqRWallFunction;
         value           uniform {k0};
+    }}"""
+            )
+        else:
+            blocks.append(
+                f"""    {p}
+    {{
+        type            zeroGradient;
     }}"""
             )
     return (
@@ -770,6 +792,7 @@ def field_epsilon(
     eps0: float,
     *,
     ami_patterns: list[str] | None = None,
+    patch_types: dict[str, str] | None = None,
 ) -> str:
     """Turbulent dissipation field (RAS kEpsilon)."""
     blocks = ['     #includeEtc "caseDicts/setConstraintTypes"']
@@ -796,12 +819,19 @@ def field_epsilon(
         value           uniform {eps0};
     }}"""
             )
-        else:
+        elif _wall_like(p, patch_types):
             blocks.append(
                 f"""    {p}
     {{
         type            epsilonWallFunction;
         value           uniform {eps0};
+    }}"""
+            )
+        else:
+            blocks.append(
+                f"""    {p}
+    {{
+        type            zeroGradient;
     }}"""
             )
     return (
@@ -825,6 +855,7 @@ def field_nut(
     bc_cfg: dict[str, Any],
     *,
     ami_patterns: list[str] | None = None,
+    patch_types: dict[str, str] | None = None,
 ) -> str:
     """Turbulent viscosity field (RAS); wall-function / calculated boundaries."""
     blocks = ['     #includeEtc "caseDicts/setConstraintTypes"']
@@ -834,7 +865,7 @@ def field_nut(
             blocks.append(_bc_block(p, bc_cfg[p], "nut"))
         elif is_ami_patch(p, ami_patterns):
             blocks.append(f"    {p}\n{_cyclic_ami_bc('nut')}")
-        elif _is_open_inlet(p) or _is_open_outlet(p):
+        elif _is_open_inlet(p) or _is_open_outlet(p) or not _wall_like(p, patch_types):
             blocks.append(
                 f"""    {p}
     {{
@@ -872,6 +903,7 @@ def field_alphat(
     *,
     prt: float = 0.85,
     ami_patterns: list[str] | None = None,
+    patch_types: dict[str, str] | None = None,
 ) -> str:
     """Turbulent thermal diffusivity field (compressible RAS)."""
     blocks = ['     #includeEtc "caseDicts/setConstraintTypes"']
@@ -881,7 +913,7 @@ def field_alphat(
             blocks.append(_bc_block(p, bc_cfg[p], "alphat"))
         elif is_ami_patch(p, ami_patterns):
             blocks.append(f"    {p}\n{_cyclic_ami_bc('alphat')}")
-        elif _is_open_inlet(p) or _is_open_outlet(p):
+        elif _is_open_inlet(p) or _is_open_outlet(p) or not _wall_like(p, patch_types):
             blocks.append(
                 f"""    {p}
     {{
