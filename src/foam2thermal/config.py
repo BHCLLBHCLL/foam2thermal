@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -34,6 +35,7 @@ class CaseConfig:
     output_case: Path
     openfoam_root: Path
     bash_exe: Path
+    python_exe: Path
     solver: str
     n_procs: int
     regions: list[RegionDef]
@@ -107,6 +109,7 @@ def load_config(
         output_case=output_case.resolve(),
         openfoam_root=Path(of["root"]),
         bash_exe=Path(of.get("bash", r"C:\OF\v2412\msys64\usr\bin\bash.exe")),
+        python_exe=Path(of.get("python", sys.executable)),
         solver=of.get("solver", "chtMultiRegionSimpleFoam"),
         n_procs=int(of.get("nProcs", 8)),
         regions=regions,

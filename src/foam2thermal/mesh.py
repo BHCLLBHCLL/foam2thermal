@@ -228,19 +228,50 @@ def parse_cell_zones(path: Path) -> list[CellZoneInfo]:
     raw = path.read_bytes()
 
     zones: list[CellZoneInfo] = []
-    # Search in raw bytes directly: positions from decoded text (with
-    # errors="replace") do not map back to byte offsets when the binary
-    # payload contains invalid UTF-8 sequences, which caused wrong cell
-    # counts to be read for zones following binary data.
-    for m in re.finditer(
-        rb"([^\s(\{\t\n]+)\s*\{\s*type\s+cellZone;\s*cellLabels\s+List<label>",
-        raw,
-        flags=re.DOTALL,
-    ):
-        name = m.group(1).decode("ascii", errors="replace").strip()
-        pos = m.end()
-        labels, _ = _read_binary_label_list(raw, pos)
+    # Use bytes.find to locate cellZone blocks. The previous regex with
+    # re.DOTALL had catastrophic backtracking on binary data (~200s for a
+    # 27MB file vs <0.01s with bytes.find).
+    needle = b"type cellZone;"
+    search_from = 0
+    while True:
+        idx = raw.find(needle, search_from)
+        if idx < 0:
+            break
+        # Find "List<label>" after "type cellZone;" (should be within ~80 bytes).
+        list_pos = raw.find(b"List<label>", idx)
+        if list_pos < 0 or list_pos > idx + 200:
+            search_from = idx + len(needle)
+            continue
+        # Parse the binary label list starting right after "List<label>".
+        labels, end_pos = _read_binary_label_list(raw, list_pos + len(b"List<label>"))
+        # Parse backwards to find the zone name: the token before the "{"
+        # that precedes "type cellZone;".  Format:
+        #   \t<name>\n\t{\n\t\ttype cellZone;
+        brace_pos = raw.rfind(b"{", search_from, idx)
+        if brace_pos >= 0:
+            # Skip whitespace (newline + tab) between name and "{".
+            name_end = brace_pos
+            while name_end > 0 and raw[name_end - 1 : name_end] in (
+                b" ",
+                b"\t",
+                b"\n",
+                b"\r",
+            ):
+                name_end -= 1
+            # Scan backwards for the name token.
+            name_start = name_end
+            while name_start > 0 and raw[name_start - 1 : name_start] not in (
+                b" ",
+                b"\t",
+                b"\n",
+                b"\r",
+            ):
+                name_start -= 1
+            name = raw[name_start:name_end].decode("ascii", errors="replace").strip()
+        else:
+            name = f"zone_{len(zones)}"
         zones.append(CellZoneInfo(name=name, cell_labels=labels))
+        search_from = end_pos
     return zones
 
 
@@ -301,7 +332,11 @@ def repair_cell_zones(poly_dir: Path) -> None:
 
 
 def zone_bbox_centroid(poly_dir: Path, zone_names: list[str]) -> tuple[float, float, float]:
-    """Bounding-box centre of one or more cellZones (for MRF origin)."""
+    """Bounding-box centre of one or more cellZones (for MRF origin).
+
+    Vectorised: uses numpy ``np.isin`` to find zone-owned faces instead of a
+    Python loop over all faces (which is O(nFaces) ~ 22M and prohibitively slow).
+    """
     import numpy as np
 
     from .mesh_coalesce import (
@@ -312,26 +347,47 @@ def zone_bbox_centroid(poly_dir: Path, zone_names: list[str]) -> tuple[float, fl
 
     points = _read_binary_vector_field(poly_dir / "points")
     zones = {z.name: z for z in parse_cell_zones(poly_dir / "cellZones")}
-    cell_set: set[int] = set()
-    for name in zone_names:
-        z = zones.get(name)
-        if z:
-            cell_set.update(z.cell_labels)
-    if not cell_set:
+    cell_labels = np.concatenate(
+        [
+            np.asarray(zones[n].cell_labels, dtype=np.int64)
+            for n in zone_names
+            if n in zones and zones[n].cell_labels
+        ]
+    ) if any(n in zones and zones[n].cell_labels for n in zone_names) else np.empty(0, dtype=np.int64)
+    if cell_labels.size == 0:
         return (0.0, 0.0, 0.0)
 
     owner = _read_binary_label_list(poly_dir / "owner")
     offsets, conn = _read_faces(poly_dir / "faces")
-    used_pts: set[int] = set()
-    for fi, own in enumerate(owner):
-        if int(own) not in cell_set:
-            continue
-        s, e = int(offsets[fi]), int(offsets[fi + 1])
-        used_pts.update(int(v) for v in conn[s:e])
-    if not used_pts:
+
+    # Vectorised face selection: boolean mask of faces owned by zone cells.
+    mask = np.isin(owner, cell_labels)
+    face_idx = np.where(mask)[0]
+    if face_idx.size == 0:
         return (0.0, 0.0, 0.0)
-    idx = np.fromiter(used_pts, dtype=np.int64)
-    pts = points[idx]
+
+    starts = offsets[face_idx]
+    ends = offsets[face_idx + 1]
+    sizes = ends - starts
+
+    # Gather vertex indices from the compact connectivity array.
+    if sizes.size > 0 and np.all(sizes == sizes[0]):
+        # All matching faces share the same vertex count (e.g. all quads).
+        sz = int(sizes[0])
+        grid = starts[:, None].astype(np.int64) + np.arange(sz, dtype=np.int64)[None, :]
+        used_pts = np.unique(conn[grid.ravel()])
+    else:
+        # Variable face sizes: build a flat index array. The loop only runs
+        # over matching faces (far fewer than nFaces), not all faces.
+        total = int(sizes.sum())
+        idx_arr = np.empty(total, dtype=np.int64)
+        pos = 0
+        for s, e in zip(starts.tolist(), ends.tolist()):
+            idx_arr[pos:pos + (e - s)] = conn[s:e]
+            pos += (e - s)
+        used_pts = np.unique(idx_arr)
+
+    pts = points[used_pts]
     c = 0.5 * (pts.min(axis=0) + pts.max(axis=0))
     return (float(c[0]), float(c[1]), float(c[2]))
 

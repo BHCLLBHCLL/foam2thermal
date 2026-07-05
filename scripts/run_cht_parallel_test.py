@@ -17,10 +17,10 @@ from foam2thermal.runner import (  # noqa: E402
     openfoam_run_failed,
     reconstruct_complete,
     run_allrun_pre,
-    run_reconstruct_parallel,
     run_solver,
     solver_reached_time,
     tail_solver_log,
+    validate_temperature_results,
 )
 
 
@@ -29,23 +29,35 @@ def _clean_parallel(case_dir: Path) -> None:
 
 
 def _patch_case_numerics(cfg, case_dir: Path) -> None:
-    from foam2thermal.templates import control_dict, fv_options_limit_temperature, fv_solution_fluid
+    from foam2thermal.templates import (
+        build_region_fv_options,
+        control_dict,
+        fv_solution_fluid,
+        fv_solution_solid,
+    )
 
     p0 = cfg.initial.get("p", 101325)
     (case_dir / "system" / "controlDict").write_text(
         control_dict(cfg.numerics, cfg.solver), encoding="utf-8"
     )
     for reg in cfg.regions:
-        if reg.type != "fluid":
-            continue
-        fv = fv_solution_fluid(cfg.numerics, p_ref=p0)
         for base in (case_dir / "system" / reg.foam_name, case_dir / "system.orig" / reg.foam_name):
             base.mkdir(parents=True, exist_ok=True)
-            (base / "fvSolution").write_text(fv, encoding="utf-8")
-            opt = fv_options_limit_temperature(cfg.numerics)
+            if reg.type == "fluid":
+                (base / "fvSolution").write_text(
+                    fv_solution_fluid(cfg.numerics, p_ref=p0), encoding="utf-8"
+                )
+            else:
+                (base / "fvSolution").write_text(fv_solution_solid(), encoding="utf-8")
+            fv_opt = build_region_fv_options(
+                region_type=reg.type,
+                region_name=reg.name,
+                boundary_conditions=cfg.boundary_conditions,
+                numerics=cfg.numerics,
+            )
             opt_path = base / "fvOptions"
-            if opt:
-                opt_path.write_text(opt, encoding="utf-8")
+            if fv_opt:
+                opt_path.write_text(fv_opt, encoding="utf-8")
             elif opt_path.is_file():
                 opt_path.unlink()
 
@@ -76,11 +88,13 @@ def main() -> int:
     output_case = (ROOT / args.output_case).resolve()
     cfg = load_config(config_path, input_mesh, output_case)
     end_time = int(cfg.numerics.get("endTime", 200))
+    t0 = float(cfg.initial.get("T", 300))
 
     print(f"Input mesh : {input_mesh}")
     print(f"Config     : {config_path}")
     print(f"Output case: {output_case}")
     print(f"Target     : Time={end_time}, nProcs={cfg.n_procs}")
+    print(f"Python     : {cfg.python_exe}")
 
     if not args.skip_build:
         print("\n=== build ===")
@@ -92,7 +106,12 @@ def main() -> int:
     if not args.skip_prep:
         print("\n=== prep (Allrun.pre) ===")
         _clean_parallel(output_case)
-        result = run_allrun_pre(cfg.bash_exe, cfg.openfoam_root, output_case)
+        result = run_allrun_pre(
+            cfg.bash_exe,
+            cfg.openfoam_root,
+            output_case,
+            python_exe=cfg.python_exe,
+        )
         if result.stdout:
             print(result.stdout)
         if result.stderr:
@@ -101,7 +120,7 @@ def main() -> int:
             print("Allrun.pre failed", file=sys.stderr)
             return 1
 
-    print("\n=== solve (decomposePar + runParallel) ===")
+    print("\n=== solve (decomposePar + runParallel + reconstruct) ===")
     _patch_case_numerics(cfg, output_case)
     result = run_solver(
         cfg.bash_exe,
@@ -130,12 +149,21 @@ def main() -> int:
         return 1
 
     region_names = [r.foam_name for r in cfg.regions]
-    if reconstruct_complete(output_case, region_names):
-        print(f"\nPASS: {cfg.solver} reached Time={end_time} with {cfg.n_procs} processes.")
-        print("PASS: parallel regions reconstructed to case root.")
-    else:
+    if not reconstruct_complete(output_case, region_names):
         print("Reconstruction incomplete – check log.reconstructPar*", file=sys.stderr)
         return 1
+
+    print(f"\nPASS: {cfg.solver} reached Time={end_time} with {cfg.n_procs} processes.")
+    print("PASS: parallel regions reconstructed to case root.")
+
+    print("\n=== temperature validation ===")
+    temp_ok, temp_msgs = validate_temperature_results(output_case, end_time=end_time, t0=t0)
+    for line in temp_msgs:
+        print(f"  {line}")
+    if not temp_ok:
+        print("FAIL: temperature validation", file=sys.stderr)
+        return 1
+    print("PASS: temperature validation")
     return 0
 
 

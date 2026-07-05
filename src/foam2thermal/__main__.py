@@ -135,7 +135,12 @@ def _cmd_run(args: argparse.Namespace) -> int:
 
     if args.step in ("all", "prep"):
         print(f"Running Allrun.pre in {output_case} ...")
-        result = run_allrun_pre(cfg.bash_exe, cfg.openfoam_root, output_case)
+        result = run_allrun_pre(
+            cfg.bash_exe,
+            cfg.openfoam_root,
+            output_case,
+            python_exe=cfg.python_exe,
+        )
         if result.stdout:
             print(result.stdout)
         if result.stderr:

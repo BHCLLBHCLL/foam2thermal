@@ -241,7 +241,7 @@ def _geometric_interface_pairs(
     excluded_faces: set[int],
     geom_tol: float,
     *,
-    area_rel_tol: float = 0.05,
+    area_rel_tol: float = 0.10,
 ) -> tuple[list[tuple[int, int]], dict[int, int], int]:
     """Pair geometrically coincident inter-zone boundary faces missed by the
     exact vertex-signature pass (e.g. when their points were just outside the
@@ -251,8 +251,9 @@ def _geometric_interface_pairs(
     list of ``(face_a, face_b)`` to merge, *vert_remap* snaps face-b vertices
     onto the coincident face-a vertices (so the two faces share a vertex set
     and the cells stay watertight), and *n_suspected_unpaired* counts faces
-    that have an opposite-zone neighbour within tolerance but could not be
-    paired (visibility into remaining open interfaces).
+    that remain unpaired after both the signature and geometric passes –
+    including faces with no opposite-zone candidate at all (isolated
+    interface faces that previously went unreported).
     """
     if geom_tol <= 0:
         return [], {}, 0
@@ -293,28 +294,26 @@ def _geometric_interface_pairs(
         for dz in (-1, 0, 1)
     ]
 
-    matched: set[int] = set()
-    pairs: list[tuple[int, int]] = []
-    vert_remap: dict[int, int] = {}
-    suspected = 0
-
+    # Collect ALL candidate pairs first, then greedily match in ascending
+    # distance order.  This avoids order-sensitive greedy matching where an
+    # early face steals a partner that would fit a later face better.
+    candidate_pairs: list[tuple[float, int, int]] = []
+    cand_set = set(cands)
     for fa in cands:
-        if fa in matched:
-            continue
         za = int(cell_zone[int(owner[fa])])
         ca = centroids[fa]
         gc = tuple(int(round(v / geom_tol)) for v in ca)
-        best_fb = -1
-        best_d = geom_tol
-        has_opposite = False
         for off in neighbour_offsets:
             cell = (gc[0] + off[0], gc[1] + off[1], gc[2] + off[2])
             for fb in buckets.get(cell, ()):
-                if fb == fa or fb in matched:
+                if fb == fa or fb not in cand_set:
                     continue
                 if int(cell_zone[int(owner[fb])]) == za:
                     continue
-                if vcount[fb] != vcount[fa]:
+                # Allow vertex-count mismatch of ±1: cgns2foam may split one
+                # quad on side A into two triangles on side B (or vice versa),
+                # which previously caused all such pairs to be skipped.
+                if abs(vcount[fb] - vcount[fa]) > 1:
                     continue
                 d = float(np.linalg.norm(centroids[fb] - ca))
                 if d > geom_tol:
@@ -322,23 +321,42 @@ def _geometric_interface_pairs(
                 amax = max(areas[fa], areas[fb], 1e-300)
                 if abs(areas[fa] - areas[fb]) / amax > area_rel_tol:
                     continue
-                has_opposite = True
-                if d < best_d:
-                    best_d = d
-                    best_fb = fb
-        if best_fb < 0:
-            if has_opposite:
-                suspected += 1
-            continue
+                # Deterministic ordering: pair (lower face id first) so that
+                # sorting by distance is stable for equal distances.
+                a, b = (fa, fb) if fa < fb else (fb, fa)
+                candidate_pairs.append((d, a, b))
 
-        remap = _vertex_correspondence(points, offsets, conn, fa, best_fb, geom_tol)
-        if remap is None:
-            suspected += 1
+    # Sort by distance ascending, then by face id for determinism.
+    candidate_pairs.sort(key=lambda t: (t[0], t[1], t[2]))
+
+    matched: set[int] = set()
+    pairs: list[tuple[int, int]] = []
+    vert_remap: dict[int, int] = {}
+    loose_tol = 2.0 * geom_tol  # second-pass tolerance for vertex snapping
+
+    for d, fa, fb in candidate_pairs:
+        if fa in matched or fb in matched:
             continue
+        remap = _vertex_correspondence(points, offsets, conn, fa, fb, geom_tol)
+        if remap is None:
+            # Retry with a looser tolerance: vertices may sit just outside
+            # geom_tol when the two sides of the interface were meshed
+            # independently with slightly different node spacing.
+            remap = _vertex_correspondence(
+                points, offsets, conn, fa, fb, loose_tol
+            )
+            if remap is None:
+                continue
         matched.add(fa)
-        matched.add(best_fb)
-        pairs.append((fa, best_fb))
+        matched.add(fb)
+        pairs.append((fa, fb))
         vert_remap.update(remap)
+
+    # Count ALL remaining unpaired candidate faces, not just those that had
+    # an opposite-zone neighbour.  Isolated interface faces (no candidate
+    # within geom_tol) are the primary source of "open cells" reported by
+    # checkMesh and were previously invisible in the report.
+    suspected = sum(1 for fi in cands if fi not in matched)
 
     return pairs, vert_remap, suspected
 
@@ -351,38 +369,81 @@ def _vertex_correspondence(
     fb: int,
     geom_tol: float,
 ) -> dict[int, int] | None:
-    """Map each vertex of face *fb* to the nearest coincident vertex of *fa*.
+    """Map each vertex of the *smaller* face onto its nearest partner on the
+    *larger* face and return a ``{fb_vert: fa_vert}`` remap (only entries
+    where the two differ).
 
-    Returns a bijective ``{vb_global: va_global}`` map, or ``None`` if any
-    vertex of *fb* has no unique partner on *fa* within *geom_tol*.
+    Returns ``None`` if any vertex of the smaller face has no unique partner
+    on the larger face within *geom_tol*.
+
+    When the two faces have different vertex counts (e.g. quad vs triangle
+    split), the smaller face is mapped onto the larger one and excess
+    vertices on the larger face are simply left unmapped – the faces are
+    still considered pairable as long as every vertex of the *smaller* face
+    finds a partner.  The returned dict always uses the convention
+    ``{fb_vert: fa_vert}`` regardless of which face is larger.
     """
     sa, ea = int(offsets[fa]), int(offsets[fa + 1])
     sb, eb = int(offsets[fb]), int(offsets[fb + 1])
-    va = conn[sa:ea]
-    vb = conn[sb:eb]
-    pa = points[va]
-    used: set[int] = set()
-    remap: dict[int, int] = {}
-    for j, vbj in enumerate(vb):
-        d = np.linalg.norm(pa - points[int(vbj)], axis=1)
-        order = np.argsort(d)
-        chosen = -1
-        for k in order:
-            if d[k] > geom_tol:
+    verts_a = conn[sa:ea]  # fa vertices
+    verts_b = conn[sb:eb]  # fb vertices
+
+    if verts_a.size >= verts_b.size:
+        # fa has at least as many vertices as fb: map each fb vertex to its
+        # nearest fa vertex.  Result direction is {fb_vert: fa_vert}.
+        larger, smaller = verts_a, verts_b
+        larger_pts = points[larger]
+        remap: dict[int, int] = {}
+        used: set[int] = set()
+        for v_sm in smaller:
+            d = np.linalg.norm(larger_pts - points[int(v_sm)], axis=1)
+            order = np.argsort(d)
+            chosen = -1
+            for k in order:
+                if d[k] > geom_tol:
+                    break
+                if int(k) in used:
+                    continue
+                chosen = int(k)
                 break
-            if int(k) in used:
-                continue
-            chosen = int(k)
-            break
-        if chosen < 0:
+            if chosen < 0:
+                return None
+            used.add(chosen)
+            target = int(larger[chosen])
+            if int(v_sm) != target:
+                remap[int(v_sm)] = target
+        if len(used) != len(smaller):
             return None
-        used.add(chosen)
-        target = int(va[chosen])
-        if int(vbj) != target:
-            remap[int(vbj)] = target
-    if len(used) != len(vb):
-        return None
-    return remap
+        return remap
+    else:
+        # fb has more vertices than fa: map each fa vertex to its nearest fb
+        # vertex, then flip the mapping to {fb_vert: fa_vert}.
+        larger, smaller = verts_b, verts_a
+        larger_pts = points[larger]
+        reverse_remap: dict[int, int] = {}  # {fa_vert: fb_vert}
+        used = set()
+        for v_sm in smaller:
+            d = np.linalg.norm(larger_pts - points[int(v_sm)], axis=1)
+            order = np.argsort(d)
+            chosen = -1
+            for k in order:
+                if d[k] > geom_tol:
+                    break
+                if int(k) in used:
+                    continue
+                chosen = int(k)
+                break
+            if chosen < 0:
+                return None
+            used.add(chosen)
+            reverse_remap[int(v_sm)] = int(larger[chosen])
+        if len(used) != len(smaller):
+            return None
+        # Flip to {fb_vert: fa_vert}; only keep entries where they differ.
+        remap = {
+            fb_v: fa_v for fa_v, fb_v in reverse_remap.items() if fb_v != fa_v
+        }
+        return remap
 
 
 def _boundary_header_text(path: Path) -> str:
@@ -445,6 +506,22 @@ def _write_binary_label_list(path: Path, values: np.ndarray, header: bytes) -> N
         fh.write(f"{arr.size}\n(".encode("ascii"))
         fh.write(arr.tobytes(order="C"))
         fh.write(b")\n")
+
+
+def _resolve_patch_type(name: str, fallback: str = "wall") -> str:
+    """Return the correct OpenFOAM patch type for *name*.
+
+    cgns2foam often emits open boundaries (``open``, ``open_1`` …) as
+    ``wall``; keeping that type makes OpenFOAM impose wall constraints on
+    what should be a free boundary, which breaks mass conservation.  Open
+    boundaries must be typed ``patch``.  Specialised types (cyclicAMI,
+    mappedWall, …) are always preserved.
+    """
+    if fallback not in ("wall", "patch"):
+        return fallback
+    if name == "open" or name.startswith("open"):
+        return "patch"
+    return fallback
 
 
 def _compact_mesh(
@@ -532,7 +609,7 @@ def _compact_mesh(
         final_patches.append(
             PatchInfo(
                 name=pname,
-                patch_type=patch_type.get(pname, "wall"),
+                patch_type=_resolve_patch_type(pname, patch_type.get(pname, "wall")),
                 n_faces=n_pf,
                 start_face=cursor,
             )
@@ -564,6 +641,10 @@ def coalesce_zone_interfaces(
     by face-centroid coincidence within ``geom_tol`` (default ``5 * point_tol``)
     and snaps their vertices so the cells stay watertight.
     """
+    import sys, time
+    def _clog(msg: str) -> None:
+        print(f"[coalesce] {msg}", file=sys.stderr, flush=True)
+
     exclude_re = [re.compile(p) for p in (exclude_patterns or [r"ami_rot"])]
     if geom_tol is None:
         geom_tol = 5.0 * point_tol
@@ -573,8 +654,13 @@ def coalesce_zone_interfaces(
     neighbour_path = poly_dir / "neighbour"
     boundary_path = poly_dir / "boundary"
 
+    _clog("read points ...")
+    t0 = time.time()
     n_points_before = _read_binary_vector_field(points_path).shape[0]
     points = _read_binary_vector_field(points_path)
+    _clog(f"  points: {n_points_before} ({time.time()-t0:.1f}s)")
+    _clog("read faces/owner/neighbour ...")
+    t0 = time.time()
     faces_fmt = _faces_format(faces_path)
     offsets, conn = _read_faces(faces_path)
     owner = _read_binary_label_list(owner_path).copy()
@@ -585,6 +671,7 @@ def coalesce_zone_interfaces(
         if (poly_dir / "cellZones").is_file()
         else []
     )
+    _clog(f"  faces/owner/neighbour done ({time.time()-t0:.1f}s)")
 
     n_faces = owner.size
     nb = np.full(n_faces, -1, dtype=np.int32)
@@ -596,21 +683,21 @@ def coalesce_zone_interfaces(
     n_cells = int(owner.max()) + 1 if owner.size else 0
     cell_zone = np.full(max(n_cells, 1), -1, dtype=np.int32)
     for zi, z in enumerate(zones):
-        for c in z.cell_labels:
-            if 0 <= c < n_cells:
-                cell_zone[c] = zi
+        labels = np.asarray(z.cell_labels, dtype=np.int64)
+        valid = (labels >= 0) & (labels < n_cells)
+        cell_zone[labels[valid]] = zi
 
     # Identify excluded (e.g. AMI) patch faces before point merging so we
     # can restore their original vertices if global point merging collapses
     # two vertices of the same face into one (creating a degenerate face).
+    _clog("collect excluded (AMI) faces ...")
+    t0 = time.time()
     excluded_faces: set[int] = set()
-    excluded_face_orig_verts: dict[int, np.ndarray] = {}
     for p in patches:
         if _patch_excluded(p.name, exclude_re):
             for fi in range(p.start_face, min(p.start_face + p.n_faces, n_faces)):
                 excluded_faces.add(fi)
-                s, e = int(offsets[fi]), int(offsets[fi + 1])
-                excluded_face_orig_verts[fi] = conn[s:e].copy()
+    _clog(f"  {len(excluded_faces)} excluded faces ({time.time()-t0:.1f}s)")
 
     # Collect all vertex indices referenced by excluded (AMI) faces.
     # These vertices are excluded from the global point merge so that the
@@ -621,19 +708,21 @@ def coalesce_zone_interfaces(
         s, e = int(offsets[fi]), int(offsets[fi + 1])
         excluded_vert_ids.update(int(v) for v in conn[s:e])
 
-    # Save original connectivity for ALL faces so we can restore any face
-    # that becomes degenerate (has repeated vertices) after point merging.
-    # This prevents zero-area faces and zero-volume cells that would crash
-    # the solver.  Interface faces that become degenerate would not pair
-    # correctly anyway, so restoring them is safe.
-    all_face_orig_verts: list[np.ndarray] = [None] * n_faces
-    for fi in range(n_faces):
+    # Save original connectivity (single array copy, NOT per-face copies).
+    # The previous implementation allocated a numpy array for each of the
+    # ~22M faces, which was the dominant build-time bottleneck.
+    original_conn = conn.copy()
+    excluded_face_orig_verts: dict[int, np.ndarray] = {}
+    for fi in excluded_faces:
         s, e = int(offsets[fi]), int(offsets[fi + 1])
-        all_face_orig_verts[fi] = conn[s:e].copy()
+        excluded_face_orig_verts[fi] = original_conn[s:e].copy()
 
+    _clog("merge points ...")
+    t0 = time.time()
     original_points = points.copy()
     points, pt_map = _merge_points(points, point_tol, exclude=excluded_vert_ids)
     conn = pt_map[conn]
+    _clog(f"  merge done ({time.time()-t0:.1f}s)")
 
     # Restore degenerate faces on excluded patches by re-adding the original
     # (pre-merge) points so each face keeps its distinct vertices.
@@ -653,13 +742,15 @@ def coalesce_zone_interfaces(
     # This catches internal faces and non-excluded boundary faces whose
     # vertices were collapsed by the global point merge.  Without this,
     # zero-area faces produce NaN residuals in the solver.
+    _clog("check degenerate faces ...")
+    t0 = time.time()
     for fi in range(n_faces):
         if fi in excluded_face_orig_verts:
             continue  # already handled above
         s, e = int(offsets[fi]), int(offsets[fi + 1])
         current_verts = conn[s:e]
         if len(current_verts) != len(set(int(v) for v in current_verts)):
-            orig_verts = all_face_orig_verts[fi]
+            orig_verts = original_conn[s:e]
             new_verts: list[int] = []
             for ov in orig_verts:
                 new_idx = len(points) + len(extra_points)
@@ -670,6 +761,9 @@ def coalesce_zone_interfaces(
     if extra_points:
         points = np.vstack([points, np.array(extra_points, dtype=np.float64)])
 
+    _clog(f"degenerate check done ({time.time()-t0:.1f}s)")
+    _clog("build vertex signature keys ...")
+    t0 = time.time()
     key_to_faces: dict[tuple[int, ...], list[int]] = {}
     for fi in range(n_faces):
         if nb[fi] >= 0 or fi in excluded_faces:
@@ -677,31 +771,54 @@ def coalesce_zone_interfaces(
         key = _face_vertex_key(offsets, conn, fi)
         if key:
             key_to_faces.setdefault(key, []).append(fi)
+    _clog(f"  {len(key_to_faces)} signature buckets ({time.time()-t0:.1f}s)")
 
+    _clog("signature pairing ...")
+    t0 = time.time()
     remove = np.zeros(n_faces, dtype=bool)
     paired = 0
     for faces in key_to_faces.values():
-        if len(faces) != 2:
-            continue
-        f0, f1 = faces
-        c0, c1 = int(owner[f0]), int(owner[f1])
-        if c0 == c1:
-            continue
-        z0, z1 = int(cell_zone[c0]), int(cell_zone[c1])
-        if z0 < 0 or z1 < 0 or z0 == z1:
-            continue
-        own, nei = min(c0, c1), max(c0, c1)
-        keep = f0 if int(owner[f0]) == own else f1
-        drop = f1 if keep == f0 else f0
-        owner[keep] = own
-        nb[keep] = nei
-        remove[drop] = True
-        paired += 1
+        # A signature bucket may contain >2 faces when three or more zones
+        # meet along the same edge (T-junctions) or when cgns2foam emits
+        # duplicate interface faces.  Pair them greedily as long as we can
+        # find two faces from different zones with different owners.
+        remaining = [f for f in faces if not remove[f]]
+        i = 0
+        while i < len(remaining):
+            f0 = remaining[i]
+            c0 = int(owner[f0])
+            z0 = int(cell_zone[c0])
+            paired_here = False
+            for j in range(i + 1, len(remaining)):
+                f1 = remaining[j]
+                c1 = int(owner[f1])
+                if c0 == c1:
+                    continue
+                z1 = int(cell_zone[c1])
+                if z0 < 0 or z1 < 0 or z0 == z1:
+                    continue
+                own, nei = min(c0, c1), max(c0, c1)
+                keep = f0 if c0 == own else f1
+                drop = f1 if keep == f0 else f0
+                owner[keep] = own
+                nb[keep] = nei
+                remove[drop] = True
+                paired += 1
+                paired_here = True
+                remaining.pop(j)
+                break
+            if paired_here:
+                remaining.pop(i)
+            else:
+                i += 1
 
     paired_signature = paired
+    _clog(f"signature pairing done: {paired_signature} paired ({time.time()-t0:.1f}s)")
     paired_geometric = 0
     suspected_unpaired = 0
     if geometric_fallback:
+        _clog("geometric fallback pairing ...")
+        t0 = time.time()
         geo_pairs, vert_remap, suspected_unpaired = _geometric_interface_pairs(
             points, offsets, conn, owner, nb, remove, cell_zone, excluded_faces, geom_tol
         )
@@ -723,27 +840,49 @@ def coalesce_zone_interfaces(
             remove[drop] = True
             paired += 1
             paired_geometric += 1
+        _clog(f"geometric pairing done: +{paired_geometric} paired ({time.time()-t0:.1f}s)")
 
     if paired == 0:
+        # Build patch distribution of remaining unpaired interface faces
+        # so the user can see which interface leaks mass.
+        unpaired_by_patch: dict[str, int] = {}
+        for fi in range(n_faces):
+            if nb[fi] >= 0 or remove[fi] or fi in excluded_faces:
+                continue
+            z = int(cell_zone[int(owner[fi])])
+            if z < 0:
+                continue
+            pname = "<unknown>"
+            for p in patches:
+                if p.start_face <= fi < p.start_face + p.n_faces:
+                    pname = p.name
+                    break
+            unpaired_by_patch[pname] = unpaired_by_patch.get(pname, 0) + 1
         return {
             "paired_faces": 0,
             "paired_signature": 0,
             "paired_geometric": 0,
             "suspected_unpaired_interface_faces": suspected_unpaired,
+            "unpaired_by_patch": unpaired_by_patch,
             "points_before": n_points_before,
             "points_after": points.shape[0],
         }
 
     old_patch_of = np.full(n_faces, "", dtype=object)
     for p in patches:
-        for fi in range(p.start_face, p.start_face + p.n_faces):
-            if fi < n_faces:
-                old_patch_of[fi] = p.name
+        end = min(p.start_face + p.n_faces, n_faces)
+        if end > p.start_face:
+            old_patch_of[p.start_face:end] = p.name
 
+    _clog("compact mesh ...")
+    t0 = time.time()
     final_owner, final_nb, final_offsets, final_conn, final_patches, n_internal = _compact_mesh(
         owner, nb, offsets, conn, old_patch_of, remove, patches
     )
+    _clog(f"  compact done ({time.time()-t0:.1f}s)")
 
+    _clog("write mesh files ...")
+    t0 = time.time()
     _write_binary_vector_field(points_path, points, _read_header_bytes(points_path))
     faces_header = _read_header_bytes(faces_path)
     if faces_fmt == "binary":
@@ -755,12 +894,26 @@ def coalesce_zone_interfaces(
         neighbour_path, final_nb[:n_internal].astype(np.int32), _read_header_bytes(neighbour_path)
     )
     write_boundary(boundary_path, final_patches, _boundary_header_text(boundary_path))
+    _clog(f"  write done ({time.time()-t0:.1f}s)")
+
+    # Build patch distribution of remaining unpaired interface faces so the
+    # user can see which interface leaks mass after coalescing.
+    unpaired_by_patch = {}
+    for fi in range(n_faces):
+        if nb[fi] >= 0 or remove[fi] or fi in excluded_faces:
+            continue
+        z = int(cell_zone[int(owner[fi])])
+        if z < 0:
+            continue
+        pname = str(old_patch_of[fi]) or "<unknown>"
+        unpaired_by_patch[pname] = unpaired_by_patch.get(pname, 0) + 1
 
     return {
         "paired_faces": paired,
         "paired_signature": paired_signature,
         "paired_geometric": paired_geometric,
         "suspected_unpaired_interface_faces": suspected_unpaired,
+        "unpaired_by_patch": unpaired_by_patch,
         "points_before": n_points_before,
         "points_after": int(points.shape[0]),
         "faces_before": n_faces,

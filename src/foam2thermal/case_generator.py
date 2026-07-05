@@ -12,7 +12,9 @@ from .interfaces import InterfaceMethod, build_interface_list
 from .mesh import load_mesh, repair_cell_zones, validate_mesh_complete, zone_bbox_centroid
 from .mesh_coalesce import coalesce_zone_interfaces, _write_binary_label_list
 from .mesh_split import field_patches_for_region, interface_neighbors
+from .paths import win_to_msys
 from .templates import (
+    build_region_fv_options,
     control_dict,
     create_patch_ami,
     decompose_par_dict,
@@ -24,7 +26,6 @@ from .templates import (
     field_p_rgh,
     field_T,
     field_U,
-    fv_options_limit_temperature,
     fv_schemes_fluid,
     fv_schemes_solid,
     fv_solution_fluid,
@@ -72,9 +73,9 @@ def _write_cell_to_region(out: Path, mesh, regions: list) -> None:
         if z.name not in zone_map:
             continue
         ri = zone_map[z.name]
-        for c in z.cell_labels:
-            if 0 <= c < n_cells:
-                cell_region[c] = ri
+        labels = np.asarray(z.cell_labels, dtype=np.int64)
+        valid = (labels >= 0) & (labels < n_cells)
+        cell_region[labels[valid]] = ri
     if np.any(cell_region < 0):
         missing = int(np.sum(cell_region < 0))
         raise ValueError(f"{missing} cell(s) not assigned to any region in cellToRegion")
@@ -166,16 +167,25 @@ def _mrf_axes(rot_zones: list[str], mrf: dict) -> list[list[float]]:
 
 
 def _copy_mesh(source: Path, dest: Path, mesh_prep: dict) -> dict:
+    import sys
+
+    def _log(msg: str) -> None:
+        print(f"[copy_mesh] {msg}", file=sys.stderr, flush=True)
+
     src_poly = source / "constant" / "polyMesh"
     dst_poly = dest / "constant" / "polyMesh"
+    _log("rmtree existing polyMesh ...")
     if dst_poly.exists():
         shutil.rmtree(dst_poly)
+    _log("copytree source polyMesh ...")
     shutil.copytree(src_poly, dst_poly)
+    _log("repair_cell_zones ...")
     repair_cell_zones(dst_poly)
     coalesce_report: dict = {"paired_faces": 0}
     if mesh_prep.get("coalesce_interfaces", True):
         tol = float(mesh_prep.get("coalesce_point_tol", 1e-4))
         geom_tol = mesh_prep.get("coalesce_geom_tol")
+        _log("coalesce_zone_interfaces begin ...")
         coalesce_report = coalesce_zone_interfaces(
             dst_poly,
             point_tol=tol,
@@ -183,6 +193,7 @@ def _copy_mesh(source: Path, dest: Path, mesh_prep: dict) -> dict:
             geometric_fallback=mesh_prep.get("coalesce_geometric_fallback", True),
             geom_tol=float(geom_tol) if geom_tol is not None else None,
         )
+        _log(f"coalesce_zone_interfaces done: {coalesce_report.get('paired_faces', 0)} paired")
     return coalesce_report
 
 
@@ -244,6 +255,12 @@ def _infer_patch_region(patch: str, cfg: CaseConfig) -> str | None:
 
 def generate_case(cfg: CaseConfig, *, dry_run: bool = False) -> dict:
     """Build output case directory and helper scripts."""
+    import sys
+
+    def _log(msg: str) -> None:
+        print(f"[build] {msg}", file=sys.stderr, flush=True)
+
+    _log("validate source mesh ...")
     missing = validate_mesh_complete(cfg.source_case)
     if missing:
         raise FileNotFoundError(
@@ -251,7 +268,11 @@ def generate_case(cfg: CaseConfig, *, dry_run: bool = False) -> dict:
             "Run cgns2foam conversion first."
         )
 
+    import time
+    _log("load source mesh ...")
+    t0 = time.time()
     mesh = load_mesh(cfg.source_case)
+    _log(f"  loaded: {len(mesh.patches)} patches, {len(mesh.cell_zones)} zones ({time.time()-t0:.1f}s)")
     zone_names = [z.name for z in mesh.cell_zones]
     for reg in cfg.regions:
         for z in reg.cell_zones:
@@ -265,9 +286,12 @@ def generate_case(cfg: CaseConfig, *, dry_run: bool = False) -> dict:
     for p in mesh.patch_names:
         patch_region.setdefault(p, _infer_patch_region(p, cfg))
 
+    _log("build interface list ...")
+    t0 = time.time()
     interfaces = build_interface_list(
         mesh, cfg.raw, cfg.resolve_region_type, patch_region
     )
+    _log(f"  {len(interfaces)} interfaces ({time.time()-t0:.1f}s)")
 
     report = {
         "source": str(cfg.source_case),
@@ -288,20 +312,28 @@ def generate_case(cfg: CaseConfig, *, dry_run: bool = False) -> dict:
         return report
 
     out = cfg.output_case
+    _log(f"remove old output case ({out}) ...")
+    t0 = time.time()
     if out.exists():
         shutil.rmtree(out)
+    _log(f"  removed ({time.time()-t0:.1f}s)")
     out.mkdir(parents=True)
 
     coalesce_report = _copy_mesh(cfg.source_case, out, cfg.mesh_prep)
     report["mesh_coalesce"] = coalesce_report
+    _log(f"coalesce done: {coalesce_report.get('paired_faces', 0)} paired")
     mesh = load_mesh(out)
+    _log("write cellToRegion ...")
     _write_cell_to_region(out, mesh, cfg.regions)
+    _log("copy system files ...")
     _copy_system_for_prep(cfg.source_case, out)
     _write(
         out / "system" / "regionProperties",
         region_properties(cfg.fluid_regions, cfg.solid_regions),
     )
+    _log("compute interface neighbors ...")
     region_neighbors = interface_neighbors(out)
+    _log(f"neighbors: {region_neighbors}")
     ami_pats = _ami_patterns(cfg)
     T0 = cfg.initial.get("T", 300)
     U0 = cfg.initial.get("U", [0, 0, 0])
@@ -324,6 +356,7 @@ def generate_case(cfg: CaseConfig, *, dry_run: bool = False) -> dict:
     patch_types = {p.name: p.patch_type for p in mesh.patches}
 
     for reg in cfg.regions:
+        _log(f"region {reg.name} ({reg.type}) ...")
         mat = cfg.material_for(reg.foam_name)
         cdir = out / "constant.orig" / reg.foam_name
         _write(
@@ -341,6 +374,7 @@ def generate_case(cfg: CaseConfig, *, dry_run: bool = False) -> dict:
                 origin_spec = mrf.get("origin", "centroid")
                 if origin_spec == "centroid":
                     if len(rot_zones) == 1:
+                        _log(f"  MRF centroid for {rot_zones} ...")
                         origins = [
                             zone_bbox_centroid(out / "constant" / "polyMesh", rot_zones)
                         ]
@@ -349,6 +383,7 @@ def generate_case(cfg: CaseConfig, *, dry_run: bool = False) -> dict:
                             zone_bbox_centroid(out / "constant" / "polyMesh", [z])
                             for z in rot_zones
                         ]
+                    _log(f"  MRF origins: {origins}")
                 else:
                     pt = tuple(float(v) for v in origin_spec)
                     origins = [pt] * len(rot_zones)
@@ -367,13 +402,19 @@ def generate_case(cfg: CaseConfig, *, dry_run: bool = False) -> dict:
         if reg.type == "fluid":
             _write(sdir / "fvSchemes", fv_schemes_fluid())
             _write(sdir / "fvSolution", fv_solution_fluid(cfg.numerics, p_ref=p0))
-            fv_opt = fv_options_limit_temperature(cfg.numerics)
-            if fv_opt:
-                _write(sdir / "fvOptions", fv_opt)
         else:
             _write(sdir / "fvSchemes", fv_schemes_solid())
             _write(sdir / "fvSolution", fv_solution_solid())
+        fv_opt = build_region_fv_options(
+            region_type=reg.type,
+            region_name=reg.name,
+            boundary_conditions=cfg.boundary_conditions,
+            numerics=cfg.numerics,
+        )
+        if fv_opt:
+            _write(sdir / "fvOptions", fv_opt)
 
+    _log("write 0.orig fields ...")
     for reg in cfg.regions:
         rbc = cfg.boundary_conditions.get(reg.name, cfg.boundary_conditions.get(reg.foam_name, {}))
         patches = field_patches_for_region(
@@ -444,6 +485,7 @@ def generate_case(cfg: CaseConfig, *, dry_run: bool = False) -> dict:
         if src.is_file():
             shutil.copy2(src, scripts_dst / name)
 
+    _log("write scripts and reports ...")
     _write(out / "setup_report.json", json.dumps(report, indent=2))
     meta = cfg.raw.setdefault("_meta", {})
     meta["source_mesh"] = str(cfg.source_case)
@@ -546,9 +588,8 @@ def _allrun_pre(cfg: CaseConfig, interfaces, mesh, ami_on_mesh: list[tuple[str, 
         "export FOAM_SIGFPE=0 FOAM_SETNAN=0",
         'cd "${0%/*}" || exit',
         ". ${WM_PROJECT_DIR:?}/bin/tools/RunFunctions",
-        "# Prefer python3 (many Linux installs have no bare 'python' shim).",
-        'PYTHON="${PYTHON:-$(command -v python3 || command -v python)}"',
-        'if [ -z "$PYTHON" ]; then echo "ERROR: no python3/python on PATH"; exit 1; fi',
+        f'PYTHON="{win_to_msys(cfg.python_exe)}"',
+        "export PYTHON",
         "#------------------------------------------------------------------------------",
         "# foam2thermal – mesh prep (monolithic mesh, no constant/<region> yet)",
         "",
@@ -596,10 +637,18 @@ def _allrun_pre(cfg: CaseConfig, interfaces, mesh, ami_on_mesh: list[tuple[str, 
 
     if ami_on_mesh and mesh_prep.get("create_ami_patches", True):
         lines.extend([
+            "    # createPatch -overwrite may drop cellZones; back up & restore",
+            "    if [ -f constant/polyMesh/cellZones ]; then",
+            "        cp -f constant/polyMesh/cellZones constant/polyMesh/cellZones.bak",
+            "    fi",
             "    set +e",
             "    runApplication -s createPatch createPatch -overwrite",
             "    CP=$?",
             "    set -e",
+            "    if [ -f constant/polyMesh/cellZones.bak ]; then",
+            "        cp -f constant/polyMesh/cellZones.bak constant/polyMesh/cellZones",
+            "        rm -f constant/polyMesh/cellZones.bak",
+            "    fi",
             '    if [ "$CP" -ne 0 ]; then',
             '        echo "WARNING: createPatch exit $CP (see log.createPatch.createPatch); fixing AMI after split"',
             "    fi",

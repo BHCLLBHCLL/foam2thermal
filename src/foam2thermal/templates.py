@@ -270,9 +270,9 @@ snGradSchemes { default limited 0.33; }
 
 def _relaxation_block(numerics: dict[str, Any]) -> str:
     rel = numerics.get("relaxation", {})
-    p_rgh = rel.get("p_rgh", 0.7)
-    u = rel.get("U", 0.4)
-    h = rel.get("h", 0.9)
+    p_rgh = rel.get("p_rgh", 0.3)
+    u = rel.get("U", 0.3)
+    h = rel.get("h", 0.3)
     k = rel.get("k", 0.7)
     eps = rel.get("epsilon", 0.7)
     return f"""relaxationFactors
@@ -289,21 +289,72 @@ def fv_options_limit_temperature(numerics: dict[str, Any]) -> str | None:
         return None
     t_min = lim.get("min", 200)
     t_max = lim.get("max", 500)
-    return (
-        foam_header("dictionary", "fvOptions", "system")
-        + f"""
-limitT
+    return fv_options_assemble(
+        {
+            "limitT": fv_options_limit_temperature_block(t_min, t_max),
+        }
+    )
+
+
+def fv_options_limit_temperature_block(t_min: float, t_max: float) -> str:
+    return f"""limitT
 {{
     type            limitTemperature;
     active          yes;
     selectionMode   all;
     min             {t_min};
     max             {t_max};
-}}
+}}"""
 
-// ************************************************************************* //
-"""
+
+def fv_options_power_source(name: str, power_w: float) -> str:
+    """Uniform absolute enthalpy source (W) over all cells in the region."""
+    return f"""{name}
+{{
+    type            scalarSemiImplicitSource;
+    active          yes;
+    selectionMode   all;
+    fields          (h);
+    volumeMode      absolute;
+    injectionRateSuSp
+    {{
+        h             ({power_w} 0);
+    }}
+}}"""
+
+
+def fv_options_assemble(blocks: dict[str, str]) -> str | None:
+    if not blocks:
+        return None
+    body = "\n\n".join(blocks.values())
+    return (
+        foam_header("dictionary", "fvOptions", "system")
+        + body
+        + "\n\n// ************************************************************************* //\n"
     )
+
+
+def build_region_fv_options(
+    *,
+    region_type: str,
+    region_name: str,
+    boundary_conditions: dict[str, Any],
+    numerics: dict[str, Any],
+) -> str | None:
+    blocks: dict[str, str] = {}
+    if region_type == "fluid":
+        lim = numerics.get("limitTemperature")
+        if lim:
+            blocks["limitT"] = fv_options_limit_temperature_block(
+                lim.get("min", 200), lim.get("max", 500)
+            )
+    elif region_type == "solid":
+        from .heat_sources import region_power_watts
+
+        power = region_power_watts(boundary_conditions, region_name)
+        if power is not None and power > 0:
+            blocks["heatSource"] = fv_options_power_source("heatSource", power)
+    return fv_options_assemble(blocks)
 
 
 def decompose_par_dict(n_procs: int, *, location: str = "") -> str:
@@ -322,7 +373,7 @@ method          scotch;
 
 def fv_solution_fluid(numerics: dict[str, Any], *, p_ref: float = 101325) -> str:
     n_nc = numerics.get("nNonOrthogonalCorrectors", 0)
-    momentum = "true" if numerics.get("momentumPredictor", True) else "false"
+    momentum = "true" if numerics.get("momentumPredictor", False) else "false"
     frozen = "true" if numerics.get("frozenFlow", False) else "false"
     p_ref_cell = numerics.get("pRefCell", 0)
     # p_rgh internalField is initialised to 0 (gauge pressure); the pressure

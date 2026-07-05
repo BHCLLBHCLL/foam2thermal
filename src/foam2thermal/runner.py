@@ -48,12 +48,20 @@ def run_verify_regions(bash_exe: Path, of_root: Path, case_dir: Path) -> subproc
     )
 
 
-def run_allrun_pre(bash_exe: Path, of_root: Path, case_dir: Path) -> subprocess.CompletedProcess[str]:
+def run_allrun_pre(
+    bash_exe: Path,
+    of_root: Path,
+    case_dir: Path,
+    *,
+    python_exe: Path | None = None,
+) -> subprocess.CompletedProcess[str]:
+    py = win_to_msys(python_exe) if python_exe else ""
+    prefix = f'export PYTHON="{py}" && ' if py else ""
     return run_openfoam(
         bash_exe,
         of_root,
         case_dir,
-        "chmod +x Allrun.pre Allrun Allclean && ./Allrun.pre",
+        prefix + "chmod +x Allrun.pre Allrun Allclean && ./Allrun.pre",
     )
 
 
@@ -189,3 +197,72 @@ def tail_solver_log(case_dir: Path, *, solver: str = "chtMultiRegionSimpleFoam",
         return ""
     content = log_path.read_text(encoding="utf-8", errors="replace").splitlines()
     return "\n".join(content[-lines:])
+
+
+_DATA_COUNT_RE = re.compile(rb"\n(\d+)\s*\n\(")
+
+
+def _read_scalar_field(path: Path):
+    import numpy as np
+
+    raw = path.read_bytes()
+    if b"internalField   uniform" in raw[:2048]:
+        match = re.search(rb"internalField\s+uniform\s+([0-9.eE+-]+)", raw)
+        if match:
+            value = float(match.group(1))
+            return value, "uniform"
+    match = _DATA_COUNT_RE.search(raw)
+    if not match:
+        raise ValueError(f"Cannot parse scalar field {path}")
+    count = int(match.group(1))
+    data = np.frombuffer(raw, dtype="<f8", count=count, offset=match.end()).copy()
+    return data, "nonuniform"
+
+
+def temperature_stats(case_dir: Path, time_name: str, region: str) -> dict[str, float]:
+    field_path = case_dir / time_name / region / "T"
+    if not field_path.is_file():
+        raise FileNotFoundError(field_path)
+    values, kind = _read_scalar_field(field_path)
+    if kind == "uniform":
+        return {"min": float(values), "max": float(values), "mean": float(values)}
+    return {"min": float(values.min()), "max": float(values.max()), "mean": float(values.mean())}
+
+
+def validate_temperature_results(
+    case_dir: Path,
+    *,
+    end_time: int,
+    t0: float = 300.0,
+    heated_regions: dict[str, float] | None = None,
+) -> tuple[bool, list[str]]:
+    """Check reconstructed temperature fields for basic physical plausibility."""
+    heated_regions = heated_regions or {"CPU": 20.0, "Cu": 15.0}
+    time_name = str(end_time)
+    messages: list[str] = []
+    ok = True
+
+    for region, _power in heated_regions.items():
+        try:
+            stats = temperature_stats(case_dir, time_name, region)
+        except FileNotFoundError:
+            ok = False
+            messages.append(f"{region}: missing T at t={time_name}")
+            continue
+        messages.append(
+            f"{region}: min={stats['min']:.3f} max={stats['max']:.3f} mean={stats['mean']:.3f} K"
+        )
+        if stats["max"] <= t0 + 0.05:
+            ok = False
+            messages.append(f"{region}: expected max T > {t0 + 0.05:.1f} K (heat source inactive?)")
+
+    for region in ("air", "case1", "case2"):
+        try:
+            stats = temperature_stats(case_dir, time_name, region)
+        except FileNotFoundError:
+            continue
+        if stats["min"] < 250 or stats["max"] > 450:
+            ok = False
+            messages.append(f"{region}: temperature out of sanity band [250, 450] K")
+
+    return ok, messages

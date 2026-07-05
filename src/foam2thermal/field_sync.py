@@ -8,6 +8,7 @@ from pathlib import Path
 from .config import load_config
 from .mesh import parse_boundary
 from .templates import (
+    build_region_fv_options,
     field_alphat,
     field_epsilon,
     field_k,
@@ -73,7 +74,7 @@ def sync_region_fields(case_dir: Path) -> dict:
                 newline="\n",
             )
             (odir / "p_rgh").write_text(
-                field_p_rgh(patches, 0, bc_cfg=rbc.get("p_rgh", {}), ami_patterns=ami_pats),
+                field_p_rgh(patches, p0, bc_cfg=rbc.get("p_rgh", {}), ami_patterns=ami_pats),
                 encoding="utf-8",
                 newline="\n",
             )
@@ -98,5 +99,19 @@ def sync_region_fields(case_dir: Path) -> dict:
                     encoding="utf-8",
                     newline="\n",
                 )
+
+        fv_opt = build_region_fv_options(
+            region_type=reg.type,
+            region_name=reg.name,
+            boundary_conditions=cfg.boundary_conditions,
+            numerics=cfg.numerics,
+        )
+        for base in (case_dir / "system" / region, case_dir / "system.orig" / region):
+            base.mkdir(parents=True, exist_ok=True)
+            opt_path = base / "fvOptions"
+            if fv_opt:
+                opt_path.write_text(fv_opt, encoding="utf-8", newline="\n")
+            elif opt_path.is_file():
+                opt_path.unlink()
 
     return {"regions": report}
