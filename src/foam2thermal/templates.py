@@ -373,7 +373,7 @@ method          scotch;
 
 def fv_solution_fluid(numerics: dict[str, Any], *, p_ref: float = 101325) -> str:
     n_nc = numerics.get("nNonOrthogonalCorrectors", 0)
-    momentum = "true" if numerics.get("momentumPredictor", False) else "false"
+    momentum = "true" if numerics.get("momentumPredictor", True) else "false"
     frozen = "true" if numerics.get("frozenFlow", False) else "false"
     p_ref_cell = numerics.get("pRefCell", 0)
     # p_rgh internalField is initialised to 0 (gauge pressure); the pressure

@@ -217,7 +217,7 @@
     "writeInterval": 50,
     "deltaT": 1,
     "nNonOrthogonalCorrectors": 1,
-    "momentumPredictor": false,
+    "momentumPredictor": true,
     "frozenFlow": false,
     "pRefValue": 101325,
     "rhoMin": 0.05,

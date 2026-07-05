@@ -140,11 +140,14 @@ def _radiation_model_for(cfg: CaseConfig, region_name: str, foam_name: str) -> s
 
 
 def _default_mrf_axis_for_zone(zone_name: str) -> list[float]:
-    """Default MRF rotation axis from cellZone name (cgns2foam FPHPARTS.rotation*)."""
+    """Default MRF rotation axis from cellZone name (cgns2foam FPHPARTS.rotation*).
+
+    Symmetric dual-fan layouts should rotate in the same direction so their
+    axial flows add rather than cancel.  Both rotation1/rotation2 default to
+    +Y; override via ``mrf.axes`` in config if opposite rotation is intended.
+    """
     name = zone_name.lower()
-    if "rotation2" in name:
-        return [0.0, -1.0, 0.0]
-    if "rotation1" in name:
+    if "rotation1" in name or "rotation2" in name:
         return [0.0, 1.0, 0.0]
     return [0.0, 0.0, 1.0]
 
