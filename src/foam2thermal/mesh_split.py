@@ -54,21 +54,11 @@ def _read_label_io_list(path: Path) -> np.ndarray:
 
 
 def _region_names_from_properties(case_dir: Path) -> list[str]:
-    for rel in ("constant/regionProperties", "system/regionProperties"):
-        rp = case_dir / rel
-        if not rp.is_file():
-            continue
-        text = rp.read_text(encoding="utf-8", errors="replace")
-        names: list[str] = []
-        for block in ("fluid", "solid"):
-            m = re.search(rf"{block}\s*\(\s*([^)]+)\)", text, flags=re.DOTALL)
-            if not m:
-                continue
-            chunk = m.group(1).strip()
-            quoted = re.findall(r'"([^"]+)"', chunk)
-            names.extend(quoted if quoted else chunk.split())
-        if names:
-            return names
+    from .mesh import load_region_properties
+
+    rp = load_region_properties(case_dir)
+    if rp is not None:
+        return rp.all_regions
     raise FileNotFoundError("regionProperties not found")
 
 
@@ -135,7 +125,7 @@ def _build_patch_pairs(case_dir: Path, patches: list[PatchInfo]) -> dict[str, tu
     """
     import json
 
-    from .interfaces import is_ami_patch
+    from .interfaces import is_ami_patch, scan_cgns2foam_interfaces
 
     cfg_path = case_dir / "config.json"
     if not cfg_path.is_file():
@@ -145,17 +135,30 @@ def _build_patch_pairs(case_dir: Path, patches: list[PatchInfo]) -> dict[str, tu
     iface_cfg = cfg.get("interfaces", {})
     ami_patterns = iface_cfg.get("ami_patterns", [r"ami_rot\d+"])
 
-    name_set = {p.name for p in patches}
-
-    # Collect (master, slave) pairs from explicit list + auto-scan (_1 suffix)
     pairs: list[tuple[str, str]] = []
     for item in iface_cfg.get("explicit", []):
         pairs.append((item["master"], item["slave"]))
     if iface_cfg.get("auto_scan", True):
-        for name in sorted(name_set):
-            m = re.match(r"^(.+)_1$", name)
-            if m and m.group(1) in name_set:
-                pairs.append((m.group(1), name))
+        from .mesh import MeshInfo
+
+        mesh_info = MeshInfo(patches=patches)
+        pairs.extend(
+            scan_cgns2foam_interfaces(
+                mesh_info,
+                suffix_pattern=iface_cfg.get("suffix_pattern", r"_\d+$"),
+                ami_patterns=ami_patterns,
+                exclude=iface_cfg.get("exclude", []),
+                patch_region=patch_regions,
+            )
+        )
+        seen: set[tuple[str, str]] = set()
+        deduped: list[tuple[str, str]] = []
+        for m, s in pairs:
+            key = (m, s)
+            if key not in seen:
+                seen.add(key)
+                deduped.append(key)
+        pairs = deduped
 
     patch_pairs: dict[str, tuple[str, str, str]] = {}
     for master, slave in pairs:

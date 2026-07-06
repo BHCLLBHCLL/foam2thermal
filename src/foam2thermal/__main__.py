@@ -19,10 +19,16 @@ import json
 import sys
 from pathlib import Path
 
-from .case_generator import generate_case
-from .config import load_config
-from .interfaces import scan_cgns2foam_interfaces
-from .mesh import load_mesh, validate_mesh_complete
+from .case_generator import generate_case, cell_zone_to_config_region
+from .config import CaseConfig, load_config
+from .interfaces import scan_interfaces_report
+from .mesh import (
+    build_patch_region_map,
+    infer_patch_regions_from_topology,
+    load_mesh,
+    load_region_properties,
+    validate_mesh_complete,
+)
 from .runner import (
     openfoam_run_failed,
     reconstruct_complete,
@@ -86,29 +92,94 @@ def _cmd_check(args: argparse.Namespace) -> int:
     return 0
 
 
+def _resolve_region_type(cfg: CaseConfig, rp_types: dict[str, str]):
+    def resolve(name: str | None) -> str:
+        if not name:
+            return "unknown"
+        if name in rp_types:
+            return rp_types[name]
+        t = cfg.resolve_region_type(name)
+        if t != "unknown":
+            return t
+        return "unknown"
+
+    return resolve
+
+
 def _cmd_scan(args: argparse.Namespace) -> int:
     input_mesh, _, output_case, cfg = _resolve_paths(args)
     mesh = load_mesh(input_mesh)
-    iface_cfg = cfg.interfaces
-    pairs = scan_cgns2foam_interfaces(
+    rp = load_region_properties(input_mesh)
+    rp_types = rp.region_types if rp else {}
+    topo = infer_patch_regions_from_topology(input_mesh, mesh)
+    patch_region = dict(topo)
+    for patch, region in cfg.patch_regions.items():
+        patch_region.setdefault(patch, region)
+    if rp is None:
+        zone_map = cell_zone_to_config_region(cfg)
+        patch_region = build_patch_region_map(
+            input_mesh,
+            mesh,
+            explicit=cfg.patch_regions,
+            cell_zone_to_region=zone_map or None,
+            name_heuristic=lambda p: _name_heuristic_patch_region(p, cfg),
+        )
+    else:
+        for p in mesh.patch_names:
+            if p not in patch_region:
+                guessed = _name_heuristic_patch_region(p, cfg)
+                if guessed and guessed in rp_types:
+                    patch_region[p] = guessed
+                elif guessed:
+                    patch_region[p] = guessed
+    resolve_type = _resolve_region_type(cfg, rp_types)
+    scan_body = scan_interfaces_report(
         mesh,
-        suffix_pattern=iface_cfg.get("suffix_pattern", r"_\d+$"),
-        ami_patterns=iface_cfg.get("ami_patterns", [r"ami_rot\d+"]),
-        exclude=iface_cfg.get("exclude", []),
+        input_mesh,
+        cfg.raw,
+        resolve_region_type=resolve_type,
+        patch_region=patch_region,
+        region_properties=(
+            {"fluid": rp.fluid, "solid": rp.solid} if rp else None
+        ),
     )
     report = {
         "input_mesh": str(input_mesh.resolve()),
         "output_case": str(output_case.resolve()),
         "config": str(Path(args.config).resolve()),
-        "patches": mesh.patch_names,
-        "cell_zones": [z.name for z in mesh.cell_zones],
-        "interface_pairs": [{"master": m, "slave": s} for m, s in pairs],
+        **scan_body,
     }
     out_path = output_case / "interface_scan.json"
     _write_json(out_path, report)
     print(json.dumps(report, indent=2, ensure_ascii=False))
     print(f"\nReport: {out_path}")
     return 0
+
+
+def _name_heuristic_patch_region(patch: str, cfg: CaseConfig) -> str | None:
+    """Fallback patch→region when topology is inconclusive (mirrors build)."""
+    import re
+
+    if patch in cfg.patch_regions:
+        return cfg.patch_regions[patch]
+    base = re.sub(r"_\d+$", "", patch)
+    if "ami" in base.lower() or base.startswith("open") or base.startswith("impeller"):
+        for r in cfg.fluid_regions:
+            if r == "air":
+                return r
+        return cfg.fluid_regions[0] if cfg.fluid_regions else None
+    if base.startswith("case1"):
+        for r in cfg.fluid_regions:
+            if r == "case1":
+                return r
+    if base.startswith("case2"):
+        for r in cfg.fluid_regions:
+            if r == "case2":
+                return r
+    for r in cfg.solid_regions:
+        if base.lower().startswith(r.lower()):
+            return r
+    return None
 
 
 def _cmd_build(args: argparse.Namespace) -> int:

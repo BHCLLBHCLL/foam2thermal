@@ -116,6 +116,22 @@ class CellZoneInfo:
 
 
 @dataclass
+class RegionProperties:
+    """Parsed ``constant/regionProperties`` (OpenFOAM multi-region split)."""
+
+    fluid: list[str] = field(default_factory=list)
+    solid: list[str] = field(default_factory=list)
+
+    @property
+    def region_types(self) -> dict[str, str]:
+        return {n: "fluid" for n in self.fluid} | {n: "solid" for n in self.solid}
+
+    @property
+    def all_regions(self) -> list[str]:
+        return list(self.fluid) + list(self.solid)
+
+
+@dataclass
 class MeshInfo:
     patches: list[PatchInfo] = field(default_factory=list)
     cell_zones: list[CellZoneInfo] = field(default_factory=list)
@@ -390,6 +406,125 @@ def zone_bbox_centroid(poly_dir: Path, zone_names: list[str]) -> tuple[float, fl
     pts = points[used_pts]
     c = 0.5 * (pts.min(axis=0) + pts.max(axis=0))
     return (float(c[0]), float(c[1]), float(c[2]))
+
+
+def parse_region_properties(path: Path) -> RegionProperties | None:
+    """Parse ``regionProperties`` from *path*; return ``None`` if absent."""
+    if not path.is_file():
+        return None
+    text = path.read_text(encoding="utf-8", errors="replace")
+    fluid: list[str] = []
+    solid: list[str] = []
+    for block, dest in (("fluid", fluid), ("solid", solid)):
+        m = re.search(rf"{block}\s*\(\s*([^)]+)\)", text, flags=re.DOTALL)
+        if not m:
+            continue
+        chunk = m.group(1).strip()
+        quoted = re.findall(r'"([^"]+)"', chunk)
+        if quoted:
+            dest.extend(quoted)
+        else:
+            dest.extend(re.findall(r"[\w\.]+", chunk))
+    if not fluid and not solid:
+        return None
+    return RegionProperties(fluid=fluid, solid=solid)
+
+
+def load_region_properties(case_dir: Path) -> RegionProperties | None:
+    """Load ``regionProperties`` from ``constant/`` then ``system/``."""
+    for rel in ("constant/regionProperties", "system/regionProperties"):
+        rp = parse_region_properties(case_dir / rel)
+        if rp is not None:
+            return rp
+    return None
+
+
+def _patch_suffix_index(name: str, suffix_re: re.Pattern[str]) -> tuple[str, int]:
+    """Return ``(base_stem, suffix_index)``; unsuffixed patches use index 0."""
+    m = re.search(r"_(\d+)$", name)
+    if m:
+        return name[: m.start()], int(m.group(1))
+    return suffix_re.sub("", name), 0
+
+
+def infer_patch_regions_from_topology(
+    case_dir: Path,
+    mesh: MeshInfo,
+) -> dict[str, str]:
+    """Map each boundary patch to its owning region via mesh topology.
+
+    Uses ``owner`` + ``cellZones`` to find the majority owner cellZone for
+    each patch.  Region names come from cellZone names (cgns2foam convention).
+    """
+    import numpy as np
+
+    from .mesh_coalesce import _read_binary_label_list
+
+    poly = case_dir / "constant" / "polyMesh"
+    owner_path = poly / "owner"
+    if not owner_path.is_file() or not mesh.cell_zones:
+        return {}
+
+    owner = _read_binary_label_list(owner_path)
+    n_cells = int(owner.max()) + 1 if owner.size else 0
+    cell_to_zone = np.full(max(n_cells, 1), -1, dtype=np.int32)
+    zone_names: list[str] = []
+    for zi, z in enumerate(mesh.cell_zones):
+        zone_names.append(z.name)
+        labels = np.asarray(z.cell_labels, dtype=np.int64)
+        valid = (labels >= 0) & (labels < n_cells)
+        cell_to_zone[labels[valid]] = zi
+
+    patch_region: dict[str, str] = {}
+    for p in mesh.patches:
+        s = p.start_face
+        e = min(p.start_face + p.n_faces, owner.size)
+        if e <= s:
+            continue
+        zids = cell_to_zone[owner[s:e]]
+        zids = zids[zids >= 0]
+        if zids.size == 0:
+            continue
+        maj = int(np.bincount(zids).argmax())
+        patch_region[p.name] = zone_names[maj]
+    return patch_region
+
+
+def map_zone_to_config_region(
+    zone_name: str,
+    *,
+    cell_zone_to_region: dict[str, str] | None = None,
+) -> str:
+    """Map a cellZone / regionProperties name to a JSON config region name."""
+    if cell_zone_to_region and zone_name in cell_zone_to_region:
+        return cell_zone_to_region[zone_name]
+    return zone_name
+
+
+def build_patch_region_map(
+    case_dir: Path,
+    mesh: MeshInfo,
+    *,
+    explicit: dict[str, str] | None = None,
+    cell_zone_to_region: dict[str, str] | None = None,
+    name_heuristic=None,
+) -> dict[str, str]:
+    """Build patch → logical region map (topology > explicit > heuristics)."""
+    topo = infer_patch_regions_from_topology(case_dir, mesh)
+    patch_region: dict[str, str] = {}
+    for patch, zone in topo.items():
+        patch_region[patch] = map_zone_to_config_region(
+            zone, cell_zone_to_region=cell_zone_to_region
+        )
+    for patch, region in (explicit or {}).items():
+        patch_region.setdefault(patch, region)
+    if name_heuristic is not None:
+        for p in mesh.patch_names:
+            if p not in patch_region:
+                inferred = name_heuristic(p)
+                if inferred:
+                    patch_region[p] = inferred
+    return patch_region
 
 
 def load_mesh(case_dir: Path) -> MeshInfo:

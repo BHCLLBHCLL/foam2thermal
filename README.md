@@ -60,18 +60,42 @@ python setup_cht_case.py check \
 
 ---
 
-### `scan` — 扫描界面 patch 配对
+### `scan` — 扫描界面 patch 配对与分类
 
-识别 cgns2foam 导出的 `foo` / `foo_1` 界面 patch 对，以及 AMI 模式 patch。
+识别 cgns2foam 导出的界面 patch 链（`foo` / `foo_1` / `foo_2` …），并结合网格拓扑与 `constant/regionProperties` 自动分类耦合方式。
+
+**输入来源（优先级）：**
+
+1. **`constant/regionProperties`**（cgns2foam 网格自带）— 列出各 fluid/solid 区域名（通常与 cellZone 名一致）
+2. **网格拓扑** — 读取 `owner` + `cellZones`，按 patch 面所属单元的多数 cellZone 推断 patch→region（**优先于** JSON 中过时的 `patch_regions` 手工映射）
+3. **JSON `patch_regions`** — 仅填补拓扑无法覆盖的 patch；不覆盖拓扑结果
+
+**配对规则：** 同一 BC 基名（去掉 `_\d+` 后缀）内，按后缀序号连续配对：`foo`↔`foo_1`↔`foo_2` …；跳过两端归属同一 region 的伪配对。
+
+**分类规则：**
+
+| 界面类型 | 方法 (`method`) | 说明 |
+|----------|-----------------|------|
+| 流-流 AMI（`ami_rot*`） | `cyclicAMI` | prep 时 `createPatch` + `fix_cyclic_ami_patches.py` |
+| 流-固 / 固-固 / 跨区流-流 | `mappedWall` | split 时生成 `*_to_*` 耦合面 |
 
 ```bash
 python setup_cht_case.py scan \
-    tests/laptop_thermal_steady_orig_fix_ansa \
-    configs/laptop_thermal_steady.json \
-    cases/laptop_thermal_cht
+    tests/laptop_thermal_steady_scaled_v3_orig \
+    configs/laptop_thermal_steady_v3.json \
+    cases/laptop_thermal_cht_v3
 ```
 
-输出：`cases/laptop_thermal_cht/interface_scan.json`
+输出：`cases/<output>/interface_scan.json`，主要字段：
+
+| 字段 | 内容 |
+|------|------|
+| `region_properties` | 从输入网格读取的 fluid/solid 区域列表 |
+| `patch_regions` | 拓扑推断的 patch→region 映射 |
+| `interfaces` | 每对界面的 `kind`、`method`、`region_a`、`region_b` |
+| `interface_pairs` | 兼容旧版的 master/slave 列表 |
+
+`build` 使用同一套拓扑推断逻辑（并映射到 JSON 中的短 region 名，如 `air`、`CPU`）。
 
 ---
 
@@ -144,8 +168,8 @@ python setup_cht_case.py run ... --step solve
 # 1. 校验网格
 python setup_cht_case.py check  tests/laptop_thermal_steady_orig_fix_ansa configs/laptop_thermal_steady.json cases/laptop_thermal_cht
 
-# 2. （可选）扫描界面
-python setup_cht_case.py scan   tests/laptop_thermal_steady_orig_fix_ansa configs/laptop_thermal_steady.json cases/laptop_thermal_cht
+# 2. （推荐）扫描界面：读 regionProperties + 拓扑，输出 cyclicAMI / mappedWall 分类
+python setup_cht_case.py scan   tests/laptop_thermal_steady_scaled_v3_orig configs/laptop_thermal_steady_v3.json cases/laptop_thermal_cht_v3
 
 # 3. 生成算例
 python setup_cht_case.py build  tests/laptop_thermal_steady_orig_fix_ansa configs/laptop_thermal_steady.json cases/laptop_thermal_cht
@@ -217,8 +241,8 @@ prep 完成后：
 | `regions` | 区域名、类型（fluid/solid）、cellZones、材料 |
 | `regions[].mrf` | MRF 旋转区：`cellZones`、`omega`（rad/s）、`axis`/`axes`、`origin` |
 | `materials` | 流体/固体热物性 |
-| `interfaces` | AMI patch 配对、`ami_rotation_axis` |
-| `patch_regions` | 单体网格 patch → 逻辑区域映射 |
+| `interfaces` | AMI 显式配对、`ami_rotation_axis`、`auto_scan`（默认 true） |
+| `patch_regions` | 可选：单体网格 patch→region 补充映射；**拓扑推断优先**，仅作兜底 |
 | `boundary_conditions` | 按区域覆盖默认 BC（含 `k`/`epsilon`/`nut`/`alphat`） |
 | `turbulence` | `simulationType laminar`（默认）或 `RAS` + `RASModel`；设 RAS 时自动生成各流体区 `k`/`epsilon`/`nut`/`alphat` 场 |
 | `radiation` | 可选；字符串模型名或 `{ "default": "none", "<region>": "fvDOM" }`，缺省各区写 `radiationModel none` |
@@ -268,7 +292,26 @@ foam2thermal/
 
 ---
 
-## 示例（笔记本散热）
+## 示例（笔记本散热 v3）
+
+v3 算例：`tests/laptop_thermal_steady_scaled_v3_orig`（含 `constant/regionProperties`）→ `cases/laptop_thermal_cht_v3`（8 区域 + CPU 固体域）。
+
+```bash
+# 完整流程
+python setup_cht_case.py scan  tests/laptop_thermal_steady_scaled_v3_orig configs/laptop_thermal_steady_v3.json cases/laptop_thermal_cht_v3
+python setup_cht_case.py build tests/laptop_thermal_steady_scaled_v3_orig configs/laptop_thermal_steady_v3.json cases/laptop_thermal_cht_v3
+python setup_cht_case.py run   tests/laptop_thermal_steady_scaled_v3_orig configs/laptop_thermal_steady_v3.json cases/laptop_thermal_cht_v3 --step prep
+python setup_cht_case.py run   tests/laptop_thermal_steady_scaled_v3_orig configs/laptop_thermal_steady_v3.json cases/laptop_thermal_cht_v3 --step solve --parallel
+
+# 或一键 build + prep + 8 核求解（不含 scan）
+python scripts/run_cht_parallel_test.py
+```
+
+生成算例含 **8 个区域**（air 含旋转区 + case1 + case2 + CPU/Cu/Cover/fin1/fin2），**cyclicAMI** 旋转界面 + **mappedWall** 流固/固固耦合 + **MRF** 风扇区。
+
+---
+
+## 示例（笔记本散热 v1）
 
 ```bash
 python setup_cht_case.py build \

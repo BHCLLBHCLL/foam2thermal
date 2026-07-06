@@ -9,7 +9,13 @@ from pathlib import Path
 
 from .config import CaseConfig
 from .interfaces import InterfaceMethod, build_interface_list
-from .mesh import load_mesh, repair_cell_zones, validate_mesh_complete, zone_bbox_centroid
+from .mesh import (
+    build_patch_region_map,
+    load_mesh,
+    repair_cell_zones,
+    validate_mesh_complete,
+    zone_bbox_centroid,
+)
 from .mesh_coalesce import coalesce_zone_interfaces, _write_binary_label_list
 from .mesh_split import field_patches_for_region, interface_neighbors
 from .paths import win_to_msys
@@ -211,6 +217,15 @@ def _copy_system_for_prep(source: Path, dest: Path) -> None:
             shutil.copy2(src, dst_sys / name)
 
 
+def cell_zone_to_config_region(cfg: CaseConfig) -> dict[str, str]:
+    """Map cellZone names from the mesh to JSON config region names."""
+    mapping: dict[str, str] = {}
+    for reg in cfg.regions:
+        for z in reg.cell_zones:
+            mapping[z] = reg.name
+    return mapping
+
+
 def _infer_patch_region(patch: str, cfg: CaseConfig) -> str | None:
     """Infer which configured region a monolithic-mesh patch belongs to.
 
@@ -285,9 +300,13 @@ def generate_case(cfg: CaseConfig, *, dry_run: bool = False) -> dict:
                     f"Available: {zone_names}"
                 )
 
-    patch_region = dict(cfg.patch_regions)
-    for p in mesh.patch_names:
-        patch_region.setdefault(p, _infer_patch_region(p, cfg))
+    patch_region = build_patch_region_map(
+        cfg.source_case,
+        mesh,
+        explicit=cfg.patch_regions,
+        cell_zone_to_region=cell_zone_to_config_region(cfg) or None,
+        name_heuristic=lambda p: _infer_patch_region(p, cfg),
+    )
 
     _log("build interface list ...")
     t0 = time.time()

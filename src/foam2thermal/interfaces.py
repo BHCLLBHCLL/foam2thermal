@@ -19,6 +19,7 @@ class InterfaceKind(str, Enum):
 class InterfaceMethod(str, Enum):
     STITCH = "stitch"          # stitchMesh – coincident patch pairs (cgns2foam)
     CYCLIC_AMI = "cyclicAMI"   # rotating / sliding fluid-fluid
+    MAPPED_WALL = "mappedWall"  # split-time mappedWall coupling (cross-region)
     SKIP = "skip"              # already internal or handled elsewhere
 
 
@@ -32,9 +33,6 @@ class InterfacePair:
     region_b: str | None = None
     note: str = ""
 
-
-def _patch_stem(name: str, suffix_re: re.Pattern[str]) -> str:
-    return suffix_re.sub("", name)
 
 
 def is_ami_patch(name: str, ami_patterns: list[str]) -> bool:
@@ -56,35 +54,50 @@ def scan_cgns2foam_interfaces(
     suffix_pattern: str = r"_\d+$",
     ami_patterns: list[str] | None = None,
     exclude: list[str] | None = None,
+    patch_region: dict[str, str] | None = None,
 ) -> list[tuple[str, str]]:
-    """Scan cgns2foam-style duplicate BC patches (``foo`` ↔ ``foo_1``).
+    """Scan cgns2foam-style duplicate BC patches (``foo`` ↔ ``foo_1`` ↔ ``foo_2`` …).
 
     cgns2foam appends ``_1``, ``_2``, … when the same BC name appears in a
-    later CGNS zone.  Interface candidates are pairs where exactly one side
-    ends with ``_1`` and the other side is the stripped base name.
+    later CGNS zone.  Interface candidates are **consecutive** suffix pairs
+    within the same base stem (``foo``/``foo_1``, ``foo_1``/``foo_2``, …).
     """
     ami_patterns = ami_patterns or [r"ami_rot\d+"]
     exclude_set = set(exclude or [])
     suffix_re = re.compile(suffix_pattern)
     names = set(mesh.patch_names) - exclude_set
 
+    groups: dict[str, list[tuple[int, str]]] = {}
+    for name in names:
+        base, idx = _patch_suffix_index(name, suffix_re)
+        groups.setdefault(base, []).append((idx, name))
+
     pairs: list[tuple[str, str]] = []
     seen: set[frozenset[str]] = set()
 
-    for name in sorted(names):
-        m = re.match(r"^(.+)_1$", name)
-        if not m:
-            continue
-        base = m.group(1)
-        if base not in names:
-            continue
-        key = frozenset({base, name})
-        if key in seen:
-            continue
-        seen.add(key)
-        pairs.append((base, name))
+    for base in sorted(groups):
+        items = sorted(groups[base], key=lambda x: x[0])
+        for i in range(len(items) - 1):
+            master, slave = items[i][1], items[i + 1][1]
+            if patch_region:
+                reg_m = patch_region.get(master)
+                reg_s = patch_region.get(slave)
+                if reg_m and reg_s and reg_m == reg_s:
+                    continue
+            key = frozenset({master, slave})
+            if key in seen:
+                continue
+            seen.add(key)
+            pairs.append((master, slave))
 
     return pairs
+
+
+def _patch_suffix_index(name: str, suffix_re: re.Pattern[str]) -> tuple[str, int]:
+    m = re.search(r"_(\d+)$", name)
+    if m:
+        return name[: m.start()], int(m.group(1))
+    return suffix_re.sub("", name), 0
 
 
 def classify_interface(
@@ -107,18 +120,21 @@ def classify_interface(
     if _is_ami_patch(master, ami_patterns) or _is_ami_patch(slave, ami_patterns):
         kind = InterfaceKind.FLUID_FLUID
         method = InterfaceMethod.CYCLIC_AMI
+    elif reg_m and reg_s and reg_m == reg_s:
+        kind = InterfaceKind.FLUID_FLUID if type_m == "fluid" else InterfaceKind.SOLID_SOLID
+        method = InterfaceMethod.STITCH
     elif type_m == "fluid" and type_s == "fluid":
         kind = InterfaceKind.FLUID_FLUID
-        method = InterfaceMethod.STITCH
+        method = InterfaceMethod.MAPPED_WALL
     elif type_m == "solid" and type_s == "solid":
         kind = InterfaceKind.SOLID_SOLID
-        method = InterfaceMethod.STITCH
+        method = InterfaceMethod.MAPPED_WALL
     elif {type_m, type_s} == {"fluid", "solid"}:
         kind = InterfaceKind.FLUID_SOLID
-        method = InterfaceMethod.STITCH
+        method = InterfaceMethod.MAPPED_WALL
     else:
         kind = InterfaceKind.FLUID_SOLID
-        method = InterfaceMethod.STITCH
+        method = InterfaceMethod.MAPPED_WALL
 
     if method_override:
         method = InterfaceMethod(method_override)
@@ -155,6 +171,7 @@ def build_interface_list(
             suffix_pattern=iface_cfg.get("suffix_pattern", r"_\d+$"),
             ami_patterns=ami_patterns,
             exclude=exclude,
+            patch_region=patch_region,
         ):
             if any(m == master and s == slave for m, s, _ in pairs):
                 continue
@@ -173,3 +190,39 @@ def build_interface_list(
             )
         )
     return result
+
+
+def scan_interfaces_report(
+    mesh: MeshInfo,
+    case_dir: Path,
+    cfg: dict[str, Any],
+    *,
+    resolve_region_type,
+    patch_region: dict[str, str],
+    region_properties: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Full interface scan report for the ``scan`` CLI subcommand."""
+    iface_cfg = cfg.get("interfaces", {})
+    interfaces = build_interface_list(
+        mesh, cfg, resolve_region_type, patch_region
+    )
+    return {
+        "patches": mesh.patch_names,
+        "cell_zones": [z.name for z in mesh.cell_zones],
+        "region_properties": region_properties,
+        "patch_regions": patch_region,
+        "interfaces": [
+            {
+                "master": i.master,
+                "slave": i.slave,
+                "kind": i.kind.value,
+                "method": i.method.value,
+                "region_a": i.region_a,
+                "region_b": i.region_b,
+            }
+            for i in interfaces
+        ],
+        "interface_pairs": [
+            {"master": i.master, "slave": i.slave} for i in interfaces
+        ],
+    }
