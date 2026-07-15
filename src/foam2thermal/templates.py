@@ -627,6 +627,17 @@ def field_U(
         type            noSlip;
     }}"""
             )
+        elif "impeller" in p.lower():
+            # MRF impeller blades must use movingWallVelocity (absolute U of
+            # the wall = omega x r).  noSlip forces absolute U=0 and fights
+            # the MRF source terms, producing spurious hundreds of m/s jets.
+            blocks.append(
+                f"""    {p}
+    {{
+        type            movingWallVelocity;
+        value           uniform (0 0 0);
+    }}"""
+            )
         else:
             blocks.append(
                 f"""    {p}
