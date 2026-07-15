@@ -9,8 +9,12 @@ CLI 工作流：`check → scan → build → prep (Allrun.pre) → solve`
 
 ```
 CGNS ──(cgns2foam，外部)──► 单体网格 ──(foam2thermal)──► 多区域 CHT 算例 ──► 求解
-                              ✅ 主流程已打通              ✅ v3 算例 Windows 8 核可达 Time=100
+                              ✅ 主流程已打通
+                              ✅ v0.5 BCs_fix / v3：Windows 8 核可达 Time=100
+                              ✅ 默认不做 coalesce/stitch（界面保留为 patch）
 ```
+
+推荐配置：`configs/laptop_thermal_steady_v3_BCs_fix.json`（详见 `docs/tech_bcs_fix_interfaces.md`）。
 
 ---
 
@@ -21,33 +25,36 @@ CGNS 网格
   │
   ├─ 1. 读取 CGNS → OpenFOAM 单体网格 (cgns2foam 外部工具)
   │
-  ├─ 2. 网格合并 (mesh_coalesce.py)
-  │     ├─ 识别配对界面面 (stitch / cyclicAMI)
+  ├─ 2. 可选网格合并 (mesh_coalesce.py)  【v3/BCs_fix 默认关闭】
+  │     ├─ 识别配对界面面并合并为内部面
   │     ├─ 合并重合点 (排除 AMI 顶点)
-  │     ├─ 消除退化面 (重复顶点恢复)
+  │     ├─ 几何兜底配对 (coalesce_geometric_fallback)
   │     └─ 输出合并后单体 polyMesh
   │
-  ├─ 3. 案例生成 (case_generator.py)
-  │     ├─ 生成 system/ (controlDict, fvSchemes, fvSolution)
-  │     ├─ 生成 constant/ (thermophysicalProperties, MRFProperties, g)
-  │     └─ 生成 0.orig/ (T, U, p, p_rgh 初始场)
+  ├─ 3. 界面扫描 (interfaces.py) + 案例生成 (case_generator.py)
+  │     ├─ 等面数配对 + 后缀链兜底 → cyclicAMI / mappedWall
+  │     ├─ 将 patch_regions 与扫描界面写入输出 config.json
+  │     ├─ 生成 system/ / constant.orig/ / 0.orig/
+  │     └─ impeller → movingWallVelocity；AMI → cyclicAMI 场 BC
   │
   ├─ 4. 区域分裂 (mesh_split.py)
   │     ├─ 按 cellToRegion / cellZone 分割单体网格为多区域
-  │     ├─ 生成 mappedWall 耦合面
+  │     ├─ 按扫描配对生成 mappedWall（跳过 cyclicAMI / rotation）
   │     ├─ 写入各 region 的 cellZones（MRF 所需）
   │     └─ 输出 constant/<region>/polyMesh（faces 保持 binary faceCompactList）
   │
   ├─ 5. 场同步 (field_sync.py)
-  │     └─ 根据分裂后实际边界 patch 重新生成 0.orig 场文件
+  │     └─ 按分裂后实际 boundary 重写 0.orig（AMI 精确名并入模式）
   │
   └─ 6. AMI 补丁修复 (fix_cyclic_ami_patches.py)
-        └─ 将 AMI 边界类型从 wall 改为 cyclicAMI
+        └─ 按 config explicit / ami_patterns 将 wall 升级为 cyclicAMI
 ```
 
 ---
 
-## 2. 网格合并 (mesh_coalesce.py)
+## 2. 网格合并 (mesh_coalesce.py) — 可选
+
+> **v3 / BCs_fix 默认关闭**（`mesh_prep.coalesce_interfaces=false`）。界面保留为边界 patch，由 split 生成 mappedWall。以下算法在显式开启 coalesce 时仍适用。
 
 ### 2.1 点合并算法
 
@@ -110,8 +117,14 @@ cgns2foam 导出的 `faceCompactList` 可能存在**非单调 offset**（如 fac
 
 ### 2.6 界面扫描与 patch→region 推断（`interfaces.py` / `mesh.py`）
 
-cgns2foam 在同一 BC 名跨多个 zone 时导出 `foo` / `foo_1` / `foo_2` … 链式 patch。
-`scan` 与 `build` 共用以下逻辑（`build` 另将 cellZone 名映射为 JSON 短 region 名）。
+cgns2foam 可能导出两种界面命名：
+
+| 风格 | 示例 | 配对策略 |
+|------|------|----------|
+| 后缀链 | `case2_s` / `case2_s_1` / … | 同基名连续后缀（兜底） |
+| BCs_fix / PartSurface | `_PartSurface_Cu_block` ↔ `_PartSurface_air_domain_3` | **等面数 + 名称↔region token 打分（优先）** |
+
+`scan` 与 `build` 共用以下逻辑（`build` 另将 cellZone 名映射为 JSON 短 region 名，并把结果写入输出 `config.json`）。
 
 #### 2.6.1 读取 `constant/regionProperties`
 
@@ -135,21 +148,21 @@ regions
 2. 对每个 patch，取其面的 owner cell 所属 zone 的**众数**作为 patch 归属 region
 3. 优先级：**拓扑 > JSON `patch_regions`（仅补缺）> 名称启发式**
 
-相比手工 `patch_regions`（如 `case1_s: case1`），拓扑可正确识别 cgns2foam `_1` 后缀 patch 实际归属的 zone（例如 `case1_s` 面属于 air，`case1_s_1` 属于 fan1）。
+#### 2.6.3 两级界面配对（v0.5）
 
-#### 2.6.3 链式 patch 配对
+`scan_cgns2foam_interfaces()`：
 
-`scan_cgns2foam_interfaces()` 在同一 BC 基名内按后缀序号连续配对：
-
-```
-case2_s ↔ case2_s_1 ↔ case2_s_2 ↔ case2_s_3 ↔ case2_s_4
-```
-
-跳过 master/slave 归属同一 region 的条目。
+1. **`scan_face_count_interfaces`**（有 `patch_region` 时优先）  
+   相同 `nFaces`、不同 region；`_pair_name_score` 选最优对；跳过 `impeller*`。
+2. **`scan_suffix_interfaces`**（兜底）  
+   `foo`↔`foo_1`↔…；跳过同 region；面数比须 ≤ `suffix_face_ratio_max`（默认 1.15）；已 claimed 的 patch 不再加入。
 
 #### 2.6.4 界面分类与方法
 
-`classify_interface()` 输出 `kind` + `method`：
+`classify_interface()` 输出 `kind` + `method`。AMI 命中条件：
+
+- `ami_patterns`（默认 `ami_rot\d+`、`.*[Rr]otation\d*`）
+- 或 patch / 归属 region 名含 `rotation`
 
 | kind | method | 后续处理 |
 |------|--------|----------|
@@ -158,7 +171,9 @@ case2_s ↔ case2_s_1 ↔ case2_s_2 ↔ case2_s_3 ↔ case2_s_4
 | `fluid_solid` | `mappedWall` | split 生成 `*_to_*` |
 | `solid_solid` | `mappedWall` | split 生成 `*_to_*` |
 
-`scan` 报告写入 `interface_scan.json`（含 `region_properties`、`patch_regions`、`interfaces`）。
+`scan` 报告写入 `interface_scan.json`。`build` 将扫描结果合并进输出 `config.json` 的 `interfaces.explicit`（用户显式优先）。
+
+专题说明：`docs/tech_bcs_fix_interfaces.md`。
 
 ---
 
@@ -171,10 +186,11 @@ case2_s ↔ case2_s_1 ↔ case2_s_2 ↔ case2_s_3 ↔ case2_s_4
 1. 遍历所有面，根据 owner/neighbour 的区域归属分类：
    - 两端同区域 → 内部面
    - 一端为本区域 → 边界面（保留原 patch 名）
-   - 跨区域 → 耦合面（生成 `mappedWall` 类型）
-2. 重新编号点、面、单元
-3. 从单体 cellZones 映射并写入各 region 的 `cellZones`（供 MRF `cellZone` 引用）
-4. 输出各区域 `constant/<region>/polyMesh/`
+   - 跨区域且在扫描配对中 → 耦合面（生成 `mappedWall`）
+2. **跳过** `interfaces.explicit` 中 `cyclicAMI` 对，以及名含 `rotation` 的 patch（留给 createPatch）
+3. 重新编号点、面、单元
+4. 从单体 cellZones 映射并写入各 region 的 `cellZones`（供 MRF `cellZone` 引用）
+5. 输出各区域 `constant/<region>/polyMesh/`
 
 ### 3.2 耦合面命名
 
@@ -226,13 +242,24 @@ air_to_CPU
 
 ### 4.3 AMI 补丁自动识别
 
-通过 `ami_patterns` 正则匹配（默认 `ami_rot\d+`）自动识别 AMI 补丁，
-生成 `cyclicAMI` 边界条件：
+通过 `ami_patterns` 正则匹配（默认 `ami_rot\d+`、`.*[Rr]otation\d*`）自动识别 AMI 补丁。
+`field_sync._effective_ami_patterns` 另将 `interfaces.explicit` 中 cyclicAMI 双方的**精确名**并入模式，
+确保 BCs_fix 中 `_PartSurface_air_domain_7` 等不含 `rotation` 的一侧也写 `cyclicAMI` BC。
 
-```python
-def is_ami_patch(name, patterns):
-    return any(re.search(p, name) for p in patterns)
+`fix_cyclic_ami_patches.py` 按同一套 explicit / patterns 把 wall 升级为 cyclicAMI（含 `transform rotational` 与 `ami_rotation_axis`）。
+
+### 4.4 叶轮壁面 `movingWallVelocity`（关键修复）
+
+**问题**：MRF 下叶轮 patch 使用 `noSlip`（绝对 U=0）与 MRF 源项对抗，叶片附近出现虚假数百 m/s 射流。
+
+**修复**：`templates.field_U` 对名含 `impeller` 的 patch 默认写：
+
 ```
+type            movingWallVelocity;
+value           uniform (0 0 0);
+```
+
+壁面绝对速度由 MRF 按 ω×r 给出。配置中应将叶轮列入 `interfaces.exclude`，避免被当成耦合界面。
 
 ---
 
@@ -353,22 +380,26 @@ chtMultiRegionSimpleFoam.exe > log.chtMultiRegionSimpleFoam 2>&1
 
 | 文件 | 职责 |
 |------|------|
-| `src/foam2thermal/mesh_coalesce.py` | 网格合并、点合并、退化面恢复 |
-| `src/foam2thermal/mesh_split.py` | 区域分裂、耦合面生成 |
-| `src/foam2thermal/mesh.py` | 网格读写、boundary/cellZones 解析、`regionProperties` 解析、拓扑 patch→region 推断 |
-| `src/foam2thermal/case_generator.py` | 案例生成主流程 |
-| `src/foam2thermal/templates.py` | OpenFOAM 字典模板 |
-| `src/foam2thermal/field_sync.py` | 分裂后场文件同步 |
+| `src/foam2thermal/mesh_coalesce.py` | 可选网格合并、点合并、几何兜底配对 |
+| `src/foam2thermal/mesh_split.py` | 区域分裂、mappedWall；跳过 AMI/rotation |
+| `src/foam2thermal/mesh.py` | 网格读写、boundary/cellZones、`regionProperties`、拓扑 patch→region |
+| `src/foam2thermal/case_generator.py` | 案例生成；扫描结果写入 `config.json` |
+| `src/foam2thermal/templates.py` | OpenFOAM 字典模板；impeller → `movingWallVelocity` |
+| `src/foam2thermal/field_sync.py` | 分裂后场同步；effective AMI 精确名模式 |
 | `src/foam2thermal/config.py` | 配置加载与校验 |
-| `src/foam2thermal/interfaces.py` | 链式界面扫描、AMI 识别、流/固分类（cyclicAMI / mappedWall） |
+| `src/foam2thermal/interfaces.py` | 等面数/后缀扫描、AMI 识别、流/固分类 |
 | `src/foam2thermal/runner.py` | MSYS2 调用 OpenFOAM（prep / solve） |
-| `configs/laptop_thermal_steady_v3.json` | 案例配置（含 CPU 固体域） |
+| `scripts/fix_cyclic_ami_patches.py` | 按配置升级 cyclicAMI |
+| `configs/laptop_thermal_steady_v3_BCs_fix.json` | **推荐** BCs_fix 配置（无 coalesce/stitch） |
+| `configs/laptop_thermal_steady_v3.json` | v3 经典后缀命名配置 |
+| `docs/tech_bcs_fix_interfaces.md` | BCs_fix 界面与叶轮专题 |
+| `docs/tech_h_initial_divergence_fix.md` | 焓值 h 初始发散修正 |
 
 ---
 
 ## 10. 功能完整度评估
 
-**综合完成度：约 75–80%**（从 cgns2foam 网格到可 prep 的多区域 CHT 算例）
+**综合完成度：约 85%**（从 cgns2foam 网格到可 prep/solve 的多区域 CHT 算例；v0.5 BCs_fix 已验证）
 
 ### 10.1 已实现（可交付）
 
@@ -376,27 +407,29 @@ chtMultiRegionSimpleFoam.exe > log.chtMultiRegionSimpleFoam 2>&1
 |------|------|------|
 | CLI 工作流 | ✅ | `check` / `scan` / `build` / `run`（prep、solve 分步） |
 | JSON 驱动配置 | ✅ | 区域、材料、BC、数值、MRF、AMI、`mesh_prep` |
-| 界面扫描与分类 | ✅ | 链式 `foo`↔`foo_1`↔`foo_2` 配对；读 `regionProperties` + 拓扑推断 patch→region；流-流 AMI→`cyclicAMI`，流固/固固→`mappedWall` |
-| 网格 coalesce | ✅ | Python 合并 stitch 界面；排除 AMI；修复 faceCompactList |
-| 区域 split | ✅ | Python 替代 `splitMeshRegions`（Windows 不崩溃） |
-| 多区域 CHT 模板 | ✅ | thermo、fvSchemes/Solution、`0.orig` 场、`regionProperties` |
-| cyclicAMI + MRF | ✅ | AMI patch 修复；多 MRF zone；split 后保留 cellZones |
-| mappedWall 耦合 | ✅ | 自动生成 `*_to_*` 面及 `turbulentTemperatureRadCoupledMixed` BC |
+| 界面扫描与分类 | ✅ | 等面数配对（BCs_fix）+ 后缀链兜底；`regionProperties` + 拓扑；AMI/`rotation` → `cyclicAMI`，其余 → `mappedWall` |
+| 配置落盘 | ✅ | `build` 写回 `patch_regions` 与扫描 `interfaces.explicit` |
+| 网格 coalesce | ✅ 可选 | 默认关（v3/BCs_fix）；开启时排除 AMI；几何兜底配对 |
+| 区域 split | ✅ | Python 替代 `splitMeshRegions`；跳过 AMI/rotation |
+| 多区域 CHT 模板 | ✅ | thermo、fvSchemes/Solution、`0.orig`、`regionProperties`、`radiationProperties` |
+| cyclicAMI + MRF | ✅ | 扩展 `ami_patterns`；精确名场 BC；多 MRF zone |
+| 叶轮壁面 | ✅ | `impeller*` → `movingWallVelocity` |
+| mappedWall 耦合 | ✅ | 自动生成 `*_to_*` 及耦合 T BC |
 | 场同步 | ✅ | split 后按实际 boundary 重写 `0.orig` |
-| 文档 | ✅ | `README.md` + 本文档 |
+| 文档 | ✅ | `README.md` + 本文档 + `docs/` 专题 |
 
 ### 10.2 部分实现 / 有局限
 
 | 模块 | 缺口 |
 |------|------|
-| **稳态求解** | v3 已在 Windows 8 核验证 Time=100；早期 v1 案例仍可能在 `Time=1` MinGW exit 3 |
-| **界面合并** | 默认 Python coalesce；新增几何兜底配对（`coalesce_geometric_fallback`，按面心重合 + 顶点吸附）减少开放单元；`stitchMesh` 仍可选且默认关闭 |
-| **湍流** | 默认 laminar；设 `turbulence.simulationType=RAS` 时自动生成各流体区 `k`/`epsilon`/`nut`/`alphat` 场（壁函数边界） |
-| **辐射** | 各区生成 `radiationProperties`（默认 `radiationModel none`，消除运行时提示，可经 `radiation` 配置启用） |
-| **瞬态 CHT** | 仅 `chtMultiRegionSimpleFoam`，无 `chtMultiRegionFoam` |
+| **稳态求解** | v0.5 BCs_fix 与 v3 已在 Windows 8 核验证 Time=100；早期 v1 仍可能 MinGW exit 3 |
+| **界面合并** | 推荐路径不 coalesce/stitch；旧网格仍可开 `coalesce_interfaces` + 几何兜底 |
+| **湍流** | 默认 laminar；RAS 时自动生成 `k`/`epsilon`/`nut`/`alphat` |
+| **辐射** | 各区 `radiationProperties`（默认 `none`） |
+| **瞬态 CHT** | 仅 `chtMultiRegionSimpleFoam` |
 | **CGNS 直读** | 依赖外部 cgns2foam |
 | **自动化测试** | 无单元/回归测试；靠 log 与手工验证 |
-| **并行** | 无 `decomposePar` / 多核 build |
+| **并行** | build 无并行；solve 支持 `nProcs` / `--parallel` |
 | **Windows prep** | `Allrun.pre` 中 `cp -f` 偶发无法覆盖；`createPatch`/`renumberMesh` exit 3 已设非致命 |
 
 ### 10.3 相对最初需求的覆盖
@@ -404,38 +437,47 @@ chtMultiRegionSimpleFoam.exe > log.chtMultiRegionSimpleFoam 2>&1
 | 需求 | 覆盖 |
 |------|------|
 | JSON 指定流体/固体域 | ✅ |
-| 扫描/指定流-流、流-固、固-固界面 | ✅ `scan`（拓扑+regionProperties）+ split `mappedWall` / AMI `cyclicAMI` |
+| 扫描/指定流-流、流-固、固-固界面 | ✅ 等面数 + 拓扑 + split `mappedWall` / AMI `cyclicAMI` |
 | OpenFOAM chtMultiRegionSimpleFoam 案例 | ✅ build + prep |
 | 散热物性、数值格式、启动脚本 | ✅ 模板 + Allrun |
-| 完整可运行仿真 | ✅ v3 算例 Windows 8 核并行可达 Time=100；更大网格建议 Linux/WSL |
+| 完整可运行仿真 | ✅ BCs_fix / v3：Windows 8 核 Time=100 |
 
 ### 10.4 后续优先级建议
 
-1. **短期**：在 Linux/WSL 跑 solve；Windows 专注 build/prep
-2. **质量**：提高 coalesce 配对完整率，减少开放单元与质量泄漏
-3. **完整度**：RAS 场文件自动生成、可选瞬态求解器、基础回归测试
+1. **短期**：在 Linux/WSL 跑长期 solve；Windows 专注 build/prep
+2. **质量**：等面数打分边界案例（多 patch 同面数）回归测试
+3. **完整度**：可选瞬态求解器、基础自动化测试
 4. **平台**：修复 Allrun.pre 在 Windows 下的文件复制逻辑
 
 ---
 
 ## 11. 转换效率评估
 
-### 11.1 v3 基准（2026-07，Windows + Python 3 + MSYS2 OF v2412）
+### 11.1 v0.5 BCs_fix 基准（2026-07，Windows + Python 3 + MSYS2 OF v2412）
 
-案例：`tests/laptop_thermal_steady_scaled_v3_orig` → `cases/laptop_thermal_cht_v3`（8 区域，含 `constant/regionProperties`）
+案例：`tests/laptop_thermal_steady_scaled_v3_orig_BCs_fix` → `cases/laptop_thermal_cht_v3_BCs_fix`  
+配置：`configs/laptop_thermal_steady_v3_BCs_fix.json`（`coalesce_interfaces=false`）
+
+| 阶段 | 结果 |
+|------|------|
+| **scan / build** | ~22 界面（2× cyclicAMI + 20× mappedWall）；`mesh_coalesce.paired_faces=0` |
+| **prep** | 8 区域 split + AMI/mappedWall 修复 + 场同步 |
+| **solve** | 8 核并行达 Time=100；reconstructPar 完成 |
+
+### 11.2 v3 基准（历史，2026-07）
+
+案例：`tests/laptop_thermal_steady_scaled_v3_orig` → `cases/laptop_thermal_cht_v3`（8 区域）
 
 | 阶段 | 耗时（约） | 结果 |
 |------|-----------|------|
-| **scan** | ~7 s | 23 对界面（2× cyclicAMI + 21× mappedWall）；`interface_scan.json` |
-| **build** | ~33 s | 22 界面写入 `setup_report.json` |
-| **prep** | ~3.2 min | split 8 区域 + AMI/mappedWall 修复 + 场同步 |
-| **solve** | ~82 min | 8 核并行 `chtMultiRegionSimpleFoam` 达 Time=100；reconstructPar 完成 |
+| **scan** | ~7 s | 界面扫描 → `interface_scan.json` |
+| **build** | ~33 s | 界面写入 `setup_report.json`（无 coalesce 时更快） |
+| **prep** | ~3.2 min | split 8 区域 + AMI/mappedWall + 场同步 |
+| **solve** | ~82 min | 8 核并行达 Time=100 |
 
-t=100 温度抽查：CPU max≈534 K，Cu max≈355 K，air mean≈300 K（air max≈458 K 略超校验带 [250,450] K）。
+### 11.3 v1 基准（历史参考）
 
-### 11.2 v1 基准（历史参考）
-
-案例：`tests/laptop_thermal_steady_orig_fix_ansa` → `cases/laptop_thermal_steady_cht`（7 区域）
+案例：`tests/laptop_thermal_steady_orig_fix_ansa` → `cases/laptop_thermal_steady_cht`（7 区域，含 coalesce）
 
 | 阶段 | 耗时（约） | 主要操作 |
 |------|-----------|----------|
@@ -443,46 +485,45 @@ t=100 温度抽查：CPU max≈534 K，Cu max≈355 K，air mean≈300 K（air m
 | **prep** | ~125 s | checkMesh + Python split + createPatch + renumberMesh + 场同步 |
 | **solve** | ~35 s 即停 | 初始化与 MRF/AMI 通过；`Time=1` 动量 1 步后 MinGW exit 3 |
 
-### 11.3 流水线与瓶颈
+### 11.4 流水线与瓶颈
 
 ```
 ┌─────────────┐     ┌──────────────────┐     ┌─────────────┐
-│ 读全网格     │ ──► │ coalesce 面配对   │ ──► │ 写全网格     │  ← build 主耗时 (~80%)
-│ numpy 全量   │     │ O(n_faces) Python │     │ binary I/O  │
+│ 读全网格     │ ──► │ 界面扫描(轻量)    │ ──► │ 写案例文件   │  ← BCs_fix build 主路径
+│ numpy 全量   │     │ 等面数 / 后缀     │     │             │
 └─────────────┘     └──────────────────┘     └─────────────┘
-                              │
-                              ▼
-                    ┌──────────────────┐
-                    │ split 7 regions  │  ← prep 主耗时
-                    │ 再次全量读写      │
-                    └──────────────────┘
+         │（仅当 coalesce_interfaces=true）
+         ▼
+┌──────────────────┐
+│ coalesce 面配对   │  ← 旧路径 build 主耗时 (~80%)
+│ O(n_faces) Python │
+└──────────────────┘
 ```
 
 | 瓶颈 | 影响 | 改进方向 |
 |------|------|----------|
-| coalesce 面配对 | build 占绝大部分时间 | 分块配对、Numba/C++ 扩展 |
-| 多次全量加载 | 内存数 GB 级；重复 parse | coalesce + split 合并 Pass |
-| 单线程 | CPU 利用率低 | 按 region 并行 split |
+| coalesce 面配对（旧路径） | build 占绝大部分时间 | 保持默认关闭；或分块/Numba |
+| 多次全量加载 | 内存数 GB 级 | coalesce + split 合并 Pass |
 | zone 几何查询 | 单次 centroid 可达 ~70 s | 缓存、按需计算 |
 | OpenFOAM 工具 | renumberMesh ~4 s | 可接受 |
 
-### 11.4 效率优点
+### 11.5 效率优点
 
-- **binary 全程**：`faceCompactList` / `labelList` / `vectorField` 不转 ASCII，I/O 与 OpenFOAM 原生一致
-- **Python split**：规避 Windows 上 `splitMeshRegions` 崩溃，prep 可重复、幂等
-- **coalesce 替代 stitchMesh**：默认不跑 OpenFOAM stitch，减少大网格反复读写
+- **binary 全程**：`faceCompactList` / `labelList` / `vectorField`
+- **Python split**：规避 Windows 上 `splitMeshRegions` 崩溃
+- **默认跳过 coalesce/stitch**：BCs_fix / v3 build 显著快于 v1
 - **prep 幂等**：已 split 案例跳过单体网格步骤
 
-### 11.5 效率评级（laptop 级 ~200 万面）
+### 11.6 效率评级（laptop 级）
 
 | 维度 | 评分 | 说明 |
 |------|------|------|
-| I/O 格式 | ★★★★☆ | binary compact，体积小、读写快 |
-| build 速度 | ★★☆☆☆ | ~3 min / 200 万面，偏慢 |
-| prep 速度 | ★★★☆☆ | ~2 min，split 为主 |
-| 内存 | ★★☆☆☆ | 全网格常驻内存，更大案例压力大 |
-| 可扩展性 | ★★☆☆☆ | 无并行；500 万面以上会明显变慢 |
-| 端到端成功率 | ★★★★☆ | v3 转换+prep+solve（8 核 Time=100）已在 Windows 验证；v1 早期 solve 仍可能 MinGW exit 3 |
+| I/O 格式 | ★★★★☆ | binary compact |
+| build 速度 | ★★★★☆ | 无 coalesce 时数十秒级 |
+| prep 速度 | ★★★☆☆ | split 为主 |
+| 内存 | ★★☆☆☆ | 全网格常驻 |
+| 可扩展性 | ★★☆☆☆ | build 无并行 |
+| 端到端成功率 | ★★★★☆ | BCs_fix / v3：8 核 Time=100 已验证 |
 
 ---
 
@@ -496,18 +537,21 @@ t=100 温度抽查：CPU max≈534 K，Cu max≈355 K，air mean≈300 K（air m
 | `pRefCell` 缺失导致求解器 FATAL | `fvSolution` 增加 `pRefCell`/`pRefValue`/`rhoMin`/`rhoMax` |
 | MRF `cellZones` 格式错误 | 改为每 zone 一条 `cellZone`（MRF1/MRF2） |
 | split 后 cellZones 为空 | `mesh_split` 写入 region cellZones |
-| `useImplicit true` + MinGW | 耦合 T BC 改为 `useImplicit false`，避免 `fvMatrixAssembly` 崩溃 |
+| `useImplicit true` + MinGW | 耦合 T BC 改为 `useImplicit false` |
+| BCs_fix 界面 stem 不同无法配对 | 等面数 + 名称↔region token 打分（v0.5） |
+| AMI 仅识别 `ami_rot*` | 扩展 `rotation*` / `_looks_like_rotation` + explicit 精确名 |
+| 叶轮 `noSlip` 虚假射流 | `impeller*` → `movingWallVelocity` |
 
 ### 仍待解决
 
-1. **网格开放单元**：未配对界面面会产生质量泄漏。已新增几何兜底配对（`mesh_prep.coalesce_geometric_fallback`，默认开启，容差 `coalesce_geom_tol` 默认 `5 × coalesce_point_tol`），对"几何重合但点未被合并"的界面面按面心重合 + 顶点吸附补配；`setup_report.json` 的 `mesh_coalesce` 增加 `paired_signature`/`paired_geometric`/`suspected_unpaired_interface_faces` 以便观测剩余开放面。仍需在真实网格上核对配对完整率。
+1. **网格开放单元（旧 coalesce 路径）**：未配对界面面会产生质量泄漏。几何兜底（`coalesce_geometric_fallback`）可补配；BCs_fix 默认不 coalesce，依赖 mappedWall 耦合而非合并内部面。
 
-2. **Windows 求解器 exit 3**（v1 历史问题）：早期 `chtMultiRegionSimpleFoam` 在 `Time=1` 求解 U 后静默退出。v3 配置（`momentumPredictor false`、h/U 松弛、`limitTemperature`、真正对流 `frozenFlow false`）已在 Windows 8 核并行跑通 Time=100。更大网格或长期算例仍建议 **WSL2/Linux**。
+2. **Windows 求解器 exit 3**（v1 历史）：v3 / BCs_fix 配置已在 8 核跑通 Time=100。更大网格仍建议 **WSL2/Linux**。
 
-3. **Allrun.pre 复制失败**：MSYS2 bash 中 `cp -f constant.orig/*` 偶发无法覆盖，需改为 Windows 兼容复制（Python/PowerShell）。
+3. **Allrun.pre 复制失败**：MSYS2 bash 中 `cp -f constant.orig/*` 偶发无法覆盖。
 
-4. **momentumPredictor false**（v3 配置）：降低初期动量收敛速度；稳定后（约 50 步）可改回 `true`。v3 已将 `frozenFlow` 由 `true` 改为 `false`（真正求解流场对流），并加回 `limitTemperature [200,500]` 作为温度安全网。
+4. **momentumPredictor / 松弛**：BCs_fix 用 `momentumPredictor false` 与较低松弛（0.2）保初期稳定；稳定后可酌情提高。
 
-5. **高非正交网格**：最大非正交性 ~84°，严重非正交面 ~1,391；需网格优化或增大 `nNonOrthogonalCorrectors`。
+5. **高非正交网格**：最大非正交性可达 ~84°；可增大 `nNonOrthogonalCorrectors`。
 
-6. **湍流/RAS**：laminar 可用；RAS 案例需补全场文件与 `turbulenceProperties` 一致性。
+6. **等面数歧义**：多个 patch 同 `nFaces` 时依赖名称打分；极端命名仍可能需 `interfaces.explicit` 手工指定。
