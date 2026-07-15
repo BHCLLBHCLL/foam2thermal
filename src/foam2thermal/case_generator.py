@@ -511,6 +511,30 @@ def generate_case(cfg: CaseConfig, *, dry_run: bool = False) -> dict:
     _write(out / "setup_report.json", json.dumps(report, indent=2))
     meta = cfg.raw.setdefault("_meta", {})
     meta["source_mesh"] = str(cfg.source_case)
+    # Persist topology-inferred patch→region and scanned interfaces so that
+    # split_regions / fix scripts pick up mappedWall + AMI pairs (BCs_fix etc.).
+    cfg.raw["patch_regions"] = {k: v for k, v in patch_region.items() if v}
+    iface_cfg = cfg.raw.setdefault("interfaces", {})
+    scanned_explicit = [
+        {
+            "master": i.master,
+            "slave": i.slave,
+            "method": i.method.value,
+            "kind": i.kind.value,
+        }
+        for i in interfaces
+    ]
+    # Keep user-provided explicit first; append scanned pairs not already listed.
+    user_explicit = list(iface_cfg.get("explicit", []))
+    seen_pairs = {(e["master"], e["slave"]) for e in user_explicit}
+    seen_pairs |= {(e["slave"], e["master"]) for e in user_explicit}
+    for item in scanned_explicit:
+        key = (item["master"], item["slave"])
+        if key in seen_pairs or (item["slave"], item["master"]) in seen_pairs:
+            continue
+        user_explicit.append(item)
+        seen_pairs.add(key)
+    iface_cfg["explicit"] = user_explicit
     _write(out / "config.json", json.dumps(cfg.raw, indent=2, ensure_ascii=False))
     _write(out / "Allrun.pre", _allrun_pre(cfg, interfaces, mesh, ami_on_mesh))
     _write(out / "Allrun", _allrun(cfg))

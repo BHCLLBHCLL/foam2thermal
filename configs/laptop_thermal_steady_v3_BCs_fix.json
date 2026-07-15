@@ -1,0 +1,317 @@
+{
+  "_comment": "v3 BCs_fix: laptop_thermal_steady_scaled_v3_orig_BCs_fix mesh with _PartSurface_* patch naming; topology+equal-nFaces scan for interfaces/AMI",
+  "openfoam": {
+    "root": "C:/OF/v2412/msys64/home/ofuser/OpenFOAM/OpenFOAM-v2412",
+    "bash": "C:/OF/v2412/msys64/usr/bin/bash.exe",
+    "python": "C:/ProgramData/anaconda3/python.exe",
+    "solver": "chtMultiRegionSimpleFoam",
+    "nProcs": 8
+  },
+  "regions": [
+    {
+      "name": "air",
+      "type": "fluid",
+      "cellZones": [
+        "laptop_3d_geom.air.air_domain",
+        "FPHPARTS.rotation1",
+        "FPHPARTS.rotation2"
+      ],
+      "material": "air",
+      "mrf": {
+        "cellZones": [
+          "FPHPARTS.rotation1",
+          "FPHPARTS.rotation2"
+        ],
+        "omega": 100,
+        "origin": "centroid"
+      }
+    },
+    {
+      "name": "case1",
+      "type": "fluid",
+      "cellZones": [
+        "laptop_3d_geom.fan1.case1"
+      ],
+      "material": "air"
+    },
+    {
+      "name": "case2",
+      "type": "fluid",
+      "cellZones": [
+        "laptop_3d_geom.fan2.case2"
+      ],
+      "material": "air"
+    },
+    {
+      "name": "CPU",
+      "type": "solid",
+      "cellZones": [
+        "laptop_3d_geom.solid_region.CPU"
+      ],
+      "material": "silicon"
+    },
+    {
+      "name": "Cu",
+      "type": "solid",
+      "cellZones": [
+        "solid_region.Cu_block"
+      ],
+      "material": "aluminum"
+    },
+    {
+      "name": "Cover",
+      "type": "solid",
+      "cellZones": [
+        "solid_region.Cover"
+      ],
+      "material": "aluminum"
+    },
+    {
+      "name": "fin1",
+      "type": "solid",
+      "cellZones": [
+        "solid_region.fin_1"
+      ],
+      "material": "aluminum"
+    },
+    {
+      "name": "fin2",
+      "type": "solid",
+      "cellZones": [
+        "solid_region.fin_2"
+      ],
+      "material": "aluminum"
+    }
+  ],
+  "region_materials": {
+    "air": "air",
+    "case1": "air",
+    "case2": "air",
+    "CPU": "silicon",
+    "Cu": "aluminum",
+    "Cover": "aluminum",
+    "fin1": "aluminum",
+    "fin2": "aluminum"
+  },
+  "materials": {
+    "air": {
+      "thermoType": {
+        "type": "heRhoThermo",
+        "mixture": "pureMixture",
+        "transport": "const",
+        "thermo": "hConst",
+        "equationOfState": "perfectGas",
+        "specie": "specie",
+        "energy": "sensibleEnthalpy"
+      },
+      "mixture": {
+        "specie": {
+          "nMoles": 1,
+          "molWeight": 28.966
+        },
+        "thermodynamics": {
+          "Cp": 1006.43,
+          "Hf": 0
+        },
+        "transport": {
+          "mu": 1.846e-05,
+          "Pr": 0.706
+        }
+      }
+    },
+    "aluminum": {
+      "thermoType": {
+        "type": "heSolidThermo",
+        "mixture": "pureMixture",
+        "transport": "constIso",
+        "thermo": "hConst",
+        "equationOfState": "rhoConst",
+        "specie": "specie",
+        "energy": "sensibleEnthalpy"
+      },
+      "mixture": {
+        "specie": {
+          "nMoles": 1,
+          "molWeight": 26.98
+        },
+        "thermodynamics": {
+          "Hf": 0,
+          "Sf": 0,
+          "Cp": 871
+        },
+        "transport": {
+          "kappa": 202.4
+        },
+        "equationOfState": {
+          "rho": 2719
+        }
+      }
+    },
+    "silicon": {
+      "thermoType": {
+        "type": "heSolidThermo",
+        "mixture": "pureMixture",
+        "transport": "constIso",
+        "thermo": "hConst",
+        "equationOfState": "rhoConst",
+        "specie": "specie",
+        "energy": "sensibleEnthalpy"
+      },
+      "mixture": {
+        "specie": {
+          "nMoles": 1,
+          "molWeight": 28.0855
+        },
+        "thermodynamics": {
+          "Hf": 0,
+          "Sf": 0,
+          "Cp": 700
+        },
+        "transport": {
+          "kappa": 130
+        },
+        "equationOfState": {
+          "rho": 2329
+        }
+      }
+    }
+  },
+  "interfaces": {
+    "auto_scan": true,
+    "ami_patterns": [
+      "ami_rot\\d+",
+      ".*[Rr]otation\\d*"
+    ],
+    "ami_rotation_axis": [
+      0,
+      0,
+      1
+    ],
+    "explicit": [
+      {
+        "master": "_PartSurface_rotation1",
+        "slave": "_PartSurface_air_domain_7",
+        "method": "cyclicAMI"
+      },
+      {
+        "master": "_PartSurface_rotation2",
+        "slave": "_PartSurface_air_domain_8",
+        "method": "cyclicAMI"
+      }
+    ],
+    "exclude": [
+      "_PartSurface_impeller1",
+      "_PartSurface_impeller2"
+    ]
+  },
+  "patch_regions": {
+    "open": "air",
+    "_PartSurface_impeller1": "air",
+    "_PartSurface_impeller2": "air"
+  },
+  "initial_conditions": {
+    "T": 300,
+    "U": [
+      0,
+      0,
+      0
+    ],
+    "p": 101325
+  },
+  "boundary_conditions": {
+    "air": {
+      "T": {
+        "open": {
+          "type": "inletOutlet",
+          "inletValue": "uniform 300",
+          "value": "uniform 300"
+        }
+      },
+      "U": {
+        "open": {
+          "type": "pressureInletOutletVelocity",
+          "value": "uniform (0 0 0)"
+        }
+      },
+      "p_rgh": {
+        "open": {
+          "type": "fixedValue",
+          "value": "uniform 101325"
+        }
+      }
+    },
+    "CPU": {
+      "T": {
+        "_PartSurface_air_domain_2": {
+          "type": "externalWallHeatFluxTemperature",
+          "mode": "power",
+          "Q": "uniform 20",
+          "kappaMethod": "solidThermo",
+          "value": "uniform 300"
+        }
+      }
+    },
+    "Cu": {
+      "T": {
+        "_PartSurface_air_domain_3": {
+          "type": "externalWallHeatFluxTemperature",
+          "mode": "power",
+          "Q": "uniform 15",
+          "kappaMethod": "solidThermo",
+          "value": "uniform 300"
+        }
+      }
+    }
+  },
+  "turbulence": {
+    "simulationType": "laminar"
+  },
+  "gravity": [
+    0,
+    0,
+    -9.81
+  ],
+  "numerics": {
+    "endTime": 100,
+    "writeInterval": 50,
+    "deltaT": 1,
+    "nNonOrthogonalCorrectors": 3,
+    "momentumPredictor": false,
+    "frozenFlow": false,
+    "pRefValue": 101325,
+    "rhoMin": 0.1,
+    "rhoMax": 2.0,
+    "limitTemperature": {
+      "min": 200,
+      "max": 500
+    },
+    "relaxation": {
+      "p_rgh": 0.2,
+      "U": 0.2,
+      "h": 0.2
+    }
+  },
+  "mesh_prep": {
+    "coalesce_interfaces": false,
+    "coalesce_point_tol": 0.0001,
+    "coalesce_geometric_fallback": false,
+    "coalesce_geom_tol": 0.0005,
+    "stitch_interfaces": false,
+    "stitch_mode": "partial",
+    "stitch_integral_ratio_max": 1.05,
+    "stitch_partial_ratio_max": 3.0,
+    "coalesce_exclude_patterns": [
+      "ami_rot",
+      "[Rr]otation"
+    ],
+    "create_ami_patches": true,
+    "stitch_tolerance": {
+      "pointMergeTol": 0.1,
+      "edgeMergeTol": 0.05
+    },
+    "split_options": [
+      "-cellZonesOnly",
+      "-overwrite"
+    ]
+  }
+}

@@ -160,9 +160,20 @@ def _build_patch_pairs(case_dir: Path, patches: list[PatchInfo]) -> dict[str, tu
                 deduped.append(key)
         pairs = deduped
 
+    # Explicit cyclicAMI pairs must stay as boundary patches for createPatch.
+    ami_explicit = {
+        frozenset({e["master"], e["slave"]})
+        for e in iface_cfg.get("explicit", [])
+        if e.get("method") == "cyclicAMI"
+    }
+
     patch_pairs: dict[str, tuple[str, str, str]] = {}
     for master, slave in pairs:
+        if frozenset({master, slave}) in ami_explicit:
+            continue
         if is_ami_patch(master, ami_patterns) or is_ami_patch(slave, ami_patterns):
+            continue
+        if "rotation" in master.lower() or "rotation" in slave.lower():
             continue
         reg_m = patch_regions.get(master)
         reg_s = patch_regions.get(slave)

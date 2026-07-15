@@ -30,12 +30,22 @@ from foam2thermal.mesh import (  # noqa: E402
 )
 
 
-def _ami_pairs(case: Path) -> list[tuple[str, str]]:
+def _load_cfg(case: Path) -> dict:
     cfg_path = case / "config.json"
     if cfg_path.is_file():
-        raw = json.loads(cfg_path.read_text(encoding="utf-8"))
+        return json.loads(cfg_path.read_text(encoding="utf-8"))
+    return {}
+
+
+def _ami_pairs(case: Path) -> list[tuple[str, str]]:
+    raw = _load_cfg(case)
+    if raw:
         explicit = raw.get("interfaces", {}).get("explicit", [])
-        pairs = [(e["master"], e["slave"]) for e in explicit if e.get("method") == "cyclicAMI"]
+        pairs = [
+            (e["master"], e["slave"])
+            for e in explicit
+            if e.get("method") == "cyclicAMI"
+        ]
         if pairs:
             return pairs
     report = case / "setup_report.json"
@@ -49,10 +59,16 @@ def _ami_pairs(case: Path) -> list[tuple[str, str]]:
     return []
 
 
+def _ami_patterns(case: Path) -> list[str]:
+    raw = _load_cfg(case)
+    return raw.get("interfaces", {}).get(
+        "ami_patterns", [r"ami_rot\d+", r".*[Rr]otation\d*"]
+    )
+
+
 def _rotation_axis(case: Path) -> tuple[float, float, float]:
-    cfg_path = case / "config.json"
-    if cfg_path.is_file():
-        raw = json.loads(cfg_path.read_text(encoding="utf-8"))
+    raw = _load_cfg(case)
+    if raw:
         axis = raw.get("interfaces", {}).get("ami_rotation_axis", [0, 0, 1])
         return (float(axis[0]), float(axis[1]), float(axis[2]))
     return (0.0, 0.0, 1.0)
@@ -74,8 +90,11 @@ def fix_case(case: Path) -> int:
         return 0
 
     axis = _rotation_axis(case)
+    ami_pats = _ami_patterns(case)
+    pair_names = {n for m, s in pairs for n in (m, s)}
     tol = 0.001
     n_fixed = 0
+    print(f"AMI pairs: {pairs}")
 
     for bnd in sorted(case.glob("constant/*/polyMesh/boundary")):
         patches = parse_boundary(bnd)
@@ -86,13 +105,13 @@ def fix_case(case: Path) -> int:
         for p in patches:
             neighbour = _partner(p.name, pairs)
             needs_fix = False
+            # Upgrade any configured cyclicAMI pair wall, or name-matched AMI walls.
             if (
                 p.patch_type == "wall"
                 and neighbour
                 and neighbour in names
-                and is_ami_patch(p.name, [r"ami_rot\d+"])
+                and (p.name in pair_names or is_ami_patch(p.name, ami_pats))
             ):
-                # Upgrade wall -> cyclicAMI
                 needs_fix = True
             elif (
                 p.patch_type == "cyclicAMI"

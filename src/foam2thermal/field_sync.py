@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 
 from .config import load_config
+from .interfaces import is_ami_patch
 from .mesh import parse_boundary
 from .templates import (
     build_region_fv_options,
@@ -18,6 +20,24 @@ from .templates import (
     field_T,
     field_U,
 )
+
+
+def _effective_ami_patterns(cfg, parsed_patches) -> list[str]:
+    """Patterns covering config AMI names + post-split cyclicAMI patch types."""
+    pats = list(cfg.interfaces.get("ami_patterns", [r"ami_rot\d+", r".*[Rr]otation\d*"]))
+    names: set[str] = set()
+    for e in cfg.interfaces.get("explicit", []):
+        if e.get("method") == "cyclicAMI":
+            names.add(e["master"])
+            names.add(e["slave"])
+    for p in parsed_patches:
+        if p.patch_type == "cyclicAMI" or is_ami_patch(p.name, pats):
+            names.add(p.name)
+    # Exact-name patterns so both AMI pair sides get cyclicAMI BCs
+    # (e.g. _PartSurface_air_domain_7 does not match *rotation*).
+    for n in sorted(names):
+        pats.append(re.escape(n))
+    return pats
 
 
 def sync_region_fields(case_dir: Path) -> dict:
@@ -37,7 +57,6 @@ def sync_region_fields(case_dir: Path) -> dict:
     p0 = cfg.initial.get("p", 101325)
     k0 = cfg.initial.get("k", 0.1)
     eps0 = cfg.initial.get("epsilon", 0.01)
-    ami_pats = cfg.interfaces.get("ami_patterns", [r"ami_rot\d+"])
     ras = str(cfg.turbulence.get("simulationType", "laminar")).lower() not in ("laminar", "")
 
     by_foam = {r.foam_name: r for r in cfg.regions}
@@ -51,6 +70,7 @@ def sync_region_fields(case_dir: Path) -> dict:
         parsed = parse_boundary(bnd_path)
         patches = [p.name for p in parsed]
         patch_types = {p.name: p.patch_type for p in parsed}
+        ami_pats = _effective_ami_patterns(cfg, parsed)
         report[region] = patches
 
         rbc = cfg.boundary_conditions.get(reg.name, cfg.boundary_conditions.get(reg.foam_name, {}))
