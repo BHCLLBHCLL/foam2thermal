@@ -161,3 +161,8 @@ Time=2 温度被 limitTemperature 裁剪到 [200, 500] K，求解器不再因热
 - 求解器fvSolution 配置：`cases/laptop_thermal_cht_v3/system/air/fvSolution`
 - 温度限值配置：`cases/laptop_thermal_cht_v3/system/air/fvOptions`
 - 模板生成函数：`src/foam2thermal/templates.py` → `fv_solution_fluid()`
+
+## 8. 后续关联（v0.5）
+
+BCs_fix 算例默认**不做 coalesce**，开放单元问题更多依赖 mappedWall 耦合而非合并内部面。
+叶轮壁面已改为 `movingWallVelocity`（见 `docs/tech_bcs_fix_interfaces.md`），与本文焓发散修正独立、可叠加使用。
