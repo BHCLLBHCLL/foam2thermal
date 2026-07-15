@@ -28,19 +28,19 @@
     },
     {
       "name": "case1",
-      "type": "fluid",
+      "type": "solid",
       "cellZones": [
         "laptop_3d_geom.fan1.case1"
       ],
-      "material": "air"
+      "material": "aluminum"
     },
     {
       "name": "case2",
-      "type": "fluid",
+      "type": "solid",
       "cellZones": [
         "laptop_3d_geom.fan2.case2"
       ],
-      "material": "air"
+      "material": "aluminum"
     },
     {
       "name": "CPU",
@@ -85,8 +85,8 @@
   ],
   "region_materials": {
     "air": "air",
-    "case1": "air",
-    "case2": "air",
+    "case1": "aluminum",
+    "case2": "aluminum",
     "CPU": "silicon",
     "Cu": "aluminum",
     "Cover": "aluminum",

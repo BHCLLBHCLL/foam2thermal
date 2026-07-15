@@ -251,21 +251,10 @@ def _infer_patch_region(patch: str, cfg: CaseConfig) -> str | None:
                 return r
         return cfg.fluid_regions[0] if cfg.fluid_regions else None
 
-    # case1 / case2 fan fluid regions
-    if base.startswith("case1"):
-        for r in cfg.fluid_regions:
-            if r == "case1":
-                return r
-    if base.startswith("case2"):
-        for r in cfg.fluid_regions:
-            if r == "case2":
-                return r
-
-    # Solid region inference by name prefix
-    for r in cfg.solid_regions:
-        # e.g. CU_s -> Cu, Cover_s -> Cover, fin1_s -> fin1, fin2_s -> fin2
-        rkey = r.lower()
-        if base.lower().startswith(rkey):
+    # Match configured region names (fluid or solid) by patch name prefix.
+    # case1/case2 may be solid (regionProperties) or fluid depending on config.
+    for r in list(cfg.fluid_regions) + list(cfg.solid_regions):
+        if base.lower().startswith(r.lower()):
             return r
 
     return None
