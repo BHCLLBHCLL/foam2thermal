@@ -3,7 +3,7 @@
 ## 概述
 
 foam2thermal 是将 CGNS 网格转换为 OpenFOAM chtMultiRegionSimpleFoam 可计算案例的工具包。
-本文档汇总转换过程中的关键技术点、**功能完整度**与**转换效率**评估，供后续开发与维护参考。
+本文档汇总转换过程中的关键技术点、**功能完整度**、**转换效率**与**已知问题分析（§13）**，供后续开发与维护参考。
 
 CLI 工作流：`check → scan → build → prep (Allrun.pre) → solve`
 
@@ -444,10 +444,12 @@ chtMultiRegionSimpleFoam.exe > log.chtMultiRegionSimpleFoam 2>&1
 
 ### 10.4 后续优先级建议
 
-1. **短期**：在 Linux/WSL 跑长期 solve；Windows 专注 build/prep
-2. **质量**：等面数打分边界案例（多 patch 同面数）回归测试
-3. **完整度**：可选瞬态求解器、基础自动化测试
-4. **平台**：修复 Allrun.pre 在 Windows 下的文件复制逻辑
+详见 **§13 转换代码问题分析**。摘要：
+
+1. **正确性**：统一 scan/build 区域类型源；配对失败与耦合面丢弃显式告警
+2. **物理 BC**：叶轮 `movingWallVelocity` 配置化；AMI 轴与 MRF 轴校验
+3. **工程**：对齐 `coalesce_interfaces` 默认值；补最小回归测试
+4. **平台**：修复 Allrun.pre 在 Windows 下的文件复制；长期 solve 建议 Linux/WSL
 
 ---
 
@@ -555,3 +557,116 @@ chtMultiRegionSimpleFoam.exe > log.chtMultiRegionSimpleFoam 2>&1
 5. **高非正交网格**：最大非正交性可达 ~84°；可增大 `nNonOrthogonalCorrectors`。
 
 6. **等面数歧义**：多个 patch 同 `nFaces` 时依赖名称打分；极端命名仍可能需 `interfaces.explicit` 手工指定。
+
+更完整的严重度分级与问题地图见 **§13**。
+
+---
+
+## 13. 转换代码问题分析（整体评估）
+
+> 评估基准：2026-07，面向 laptop CHT（v3 / BCs_fix）已端到端打通，但正确性仍依赖启发式与配置约定。换命名、跳过 prep 步骤或误用 `regionProperties` 类型时，容易出现 *silent wrong*。
+
+### 13.1 总判
+
+| 维度 | 评价 |
+|------|------|
+| laptop 网格族可用性 | ✅ scan → build → prep → solve（8 核 Time=100）可复现 |
+| 通用性 | ⚠️ 强绑定 `case1`/`ami`/`impeller`/`_PartSurface_*` 等命名 |
+| 正确性护栏 | ❌ 无自动化测试；配对/丢面/BC 错误常静默 |
+| 文档与代码一致性 | ⚠️ 部分滞后（见 §13.5） |
+
+### 13.2 问题地图
+
+```
+CGNS ──► scan 配对/分类 ──► build 模板+config ──► prep(split/AMI/sync) ──► solve
+              │                    │                      │                  │
+              ├ RP vs JSON 类型    ├ coalesce 默认 True   ├ remote 名不匹配   ├ 数值分叉
+              ├ 等面数/后缀启发式  ├ neighbors 空         ├ 叶轮/AMI BC       └ 发散/喷流
+              └ kind 误判          └ 0.orig 缺 *_to_*     └ 耦合面丢弃
+```
+
+### 13.3 正确性 / 物理（高）
+
+#### 1. MRF 叶轮边界易错
+
+叶轮曾用 `noSlip`，与 MRF 源项冲突，导致 `|U|_max` 达数百 m/s（物理叶尖 `ωR≈3 m/s`，`omega=100 rad/s`，`R≈30 mm`）。  
+已改为 `templates.field_U` 中 `*impeller*` → `movingWallVelocity`。残留风险：
+
+- 依赖 patch 名含 `impeller`
+- JSON `boundary_conditions` 若写死 `noSlip` 会覆盖模板
+- 旧算例未从 Time=0 重跑则结果仍错
+
+#### 2. 界面配对不完备 → 漏耦 / 假耦
+
+| 机制 | 风险 |
+|------|------|
+| 等面数配对（`scan_face_count_interfaces`） | 两侧 `nFaces` 不等（如 air↔Cu 925 vs 24523）无法配对，留作普通 wall |
+| 后缀链 `foo↔foo_1↔foo_2` | 可能产生非物理假界面 |
+| 名称↔region token 打分 | BCs_fix 可用，换命名易失效 |
+
+`coalesce_interfaces: false` 时，未配对界面不会并成内部面，质量泄漏风险更大。工具链对 mappedWall **不校验**面数对称（OpenFOAM 允许非共形，但大比例靠 `nearestPatchFace`，热流精度差）。
+
+#### 3. scan 与 build 区域类型可能不一致
+
+输入 `constant/regionProperties` 常把 `case1/case2` 标成 **solid**，JSON 配置为 **fluid**。  
+`scan`（`_resolve_region_type`）优先用 RP；`build` 用配置 `resolve_region_type`。报告中的 `kind` 可能误导。
+
+#### 4. split 时命名耦合面可能被丢弃
+
+`mesh_split._extract_region_mesh`：若 `remote_name` 不在 `region_names`（zone 长名 vs 短 region 名错位），`named_coup_faces` 直接 `continue`，面从区域网格消失 → 开孔/拓扑洞。无显式报错。
+
+### 13.4 流程 / 工程（高–中）
+
+#### 5. `coalesce` 默认值与文档/配置相反
+
+代码：`case_generator._copy_mesh` 中 `coalesce_interfaces` **默认 True**；v3 / BCs_fix 配置与文档多为 **false**。漏写该键会静默走慢路径。
+
+#### 6. `interface_neighbors` 在 coalesce 关闭时几乎为空
+
+只统计跨区**内部面**。cgns2foam 界面为边界双 patch 时，build 阶段邻居为空，依赖 prep 的 `sync_region_fields`；跳过 sync → `0.orig` 缺 `*_to_*`。
+
+#### 7. AMI 场 BC 曾漏配
+
+`_PartSurface_air_domain_7/8` 不匹配 `*rotation*`，`p` 写成 `calculated` → FATAL。现靠 `field_sync._effective_ami_patterns` 并入显式 AMI 名；fix 脚本与模板默认模式仍易不同步。
+
+#### 8. AMI 轴 vs MRF 轴
+
+全局一个 `interfaces.ami_rotation_axis`；MRF 按 zone 启发式（`rotation*`→+Y）。轴不一致时无自动校验（BCs_fix 已手工对齐 `[0,1,0]`）。
+
+#### 9. 数值设置分叉
+
+| 配置 | 特征 | 结果 |
+|------|------|------|
+| BCs_fix | `momentumPredictor false`、松弛 0.2、`limitT [200,500]` | 可跑到 Time=100 |
+| v3 | 曾用 `momentumPredictor true`、松弛 0.5 等 | 更易发散 |
+
+`limitTemperature` 仅挂在流体区；固体区无同等钳制。
+
+### 13.5 可维护性 / 通用性（中–低）
+
+| # | 问题 | 证据 / 影响 |
+|---|------|-------------|
+| 10 | 强绑定 laptop 命名 | `_infer_patch_region`、`open`/`impeller` 特判；换项目需改代码或大量 JSON |
+| 11 | `parse_boundary` 不完整 | 正则止于 `nFaces/startFace`；其后的 `sampleRegion`/`samplePatch` 可能读不到 |
+| 12 | Windows prep 脆弱 | `Allrun.pre` 仍 `cp -f`；`createPatch`/`checkMesh` 非致命，依赖 Python 补丁 |
+| 13 | 无自动化测试 | 配对、split、AMI sync、叶轮 BC 无回归护栏 |
+| 14 | 文档滞后 | AMI `transform` 文档曾写 `rotational`、代码为 `noOrdering`；README 混用 `python`/`python3` |
+| 15 | 其它气味 | `_build_patch_pairs` 类型标注与三元组不符；`fix_mapped_wall` 写死 `air/MRFProperties`；`omega` 无单位校验；`p_rgh` build 写 0、sync 写绝对压 |
+
+### 13.6 严重度速查
+
+| 级别 | 条目 |
+|------|------|
+| **Critical** | split 耦合面因 remote 名丢弃；scan/build 区域类型源不一致 |
+| **High** | 等面数漏耦 + coalesce 关；`interface_neighbors` 空；coalesce 默认 True；AMI/MRF 轴；数值分叉；叶轮 BC 可被覆盖 |
+| **Medium** | 假配对；`classify` 对 AMI 名强制 cyclicAMI；`parse_boundary`；omega 无校验；limitT 仅流体 |
+| **Low** | laptop 启发式；类型标注；MRF 写死 air；无测试；文档不一致 |
+
+### 13.7 优先改进建议
+
+1. **统一 region 类型源**：scan/build 都只信 JSON（或强制校正输入 RP）
+2. **配对/丢面显式告警**：未配界面、面数比过大、`named_coup` 丢弃不得静默
+3. **叶轮 BC 配置化**：`mrf.wallPatches` 或强制 `movingWallVelocity`，不单靠名字
+4. **对齐 `coalesce_interfaces` 默认值**与文档；coalesce 关时检查 mappedWall 覆盖率
+5. **最小回归**：小网格测配对、split 面数、AMI 场类型、叶轮 BC
+6. **文档与代码同步**：本文件、`README.md`、`docs/tech_bcs_fix_interfaces.md`
