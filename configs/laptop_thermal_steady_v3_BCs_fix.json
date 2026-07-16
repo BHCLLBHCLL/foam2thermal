@@ -235,7 +235,11 @@
       },
       "p_rgh": {
         "open": {
-          "type": "fixedValue",
+          "type": "prghTotalPressure",
+          "p0": "uniform 101325",
+          "U": "U",
+          "phi": "phi",
+          "rho": "rho",
           "value": "uniform 101325"
         }
       }

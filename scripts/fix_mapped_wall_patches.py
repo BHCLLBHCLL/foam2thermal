@@ -48,42 +48,55 @@ def _region_names(case: Path) -> list[str]:
 
 
 def _update_mrf_non_rotating(case: Path, regions: list[str]) -> int:
-    """Add post-split coupling patches to MRFProperties.nonRotatingPatches.
+    """Merge AMI + open + coupling patches into MRFProperties.nonRotatingPatches.
 
     The MRFProperties template is generated from the monolithic mesh (before
-    splitMeshRegions), so it only knows about the original patches (open, AMI,
-    impeller).  After split, new ``*_to_*`` coupling patches appear and must be
-    listed as nonRotating so the MRF does not try to rotate the mappedWall
-    interfaces to stationary solid regions.
-    """
-    mrf = case / "constant" / "air" / "MRFProperties"
-    if not mrf.is_file():
-        return 0
-    text = mrf.read_text(encoding="utf-8", errors="replace")
+    split), so post-split ``*_to_*`` patches must be added.  Both AMI sides and
+    all ``open*`` patches are re-asserted here in case the build-time list was
+    incomplete (e.g. ``_PartSurface_air_domain_7`` not matching ami patterns).
 
-    # Gather coupling patches from the air region boundary
+    Updates both ``constant/air`` and ``constant.orig/air`` so a later
+    ``cp constant.orig → constant`` in AllrunPrep cannot wipe the merge.
+    """
+    _ = regions
     bnd = case / "constant" / "air" / "polyMesh" / "boundary"
     if not bnd.is_file():
         return 0
-    coupling = [p.name for p in parse_boundary(bnd) if "_to_" in p.name]
-    if not coupling:
+    extras: list[str] = []
+    for p in parse_boundary(bnd):
+        if "_to_" in p.name:
+            extras.append(p.name)
+        elif p.patch_type == "cyclicAMI":
+            extras.append(p.name)
+        elif p.name == "open" or p.name.startswith("open"):
+            extras.append(p.name)
+    if not extras:
         return 0
 
-    changed = False
-    out_lines: list[str] = []
-    for line in text.splitlines():
-        m = re.match(r"^(\s*)nonRotatingPatches\s*\(\s*([^)]*)\s*\)\s*;?\s*$", line)
-        if not m:
-            out_lines.append(line)
+    for rel in (
+        Path("constant") / "air" / "MRFProperties",
+        Path("constant.orig") / "air" / "MRFProperties",
+    ):
+        mrf = case / rel
+        if not mrf.is_file():
             continue
-        indent = m.group(1)
-        existing = m.group(2).split()
-        merged = sorted(set(existing) | set(coupling))
-        out_lines.append(f"{indent}nonRotatingPatches ( {' '.join(merged)} );")
-        changed = True
-    if changed:
-        mrf.write_text("\n".join(out_lines) + "\n", encoding="utf-8")
-        print(f"updated {mrf} (added {len(coupling)} coupling patch(es))")
+        text = mrf.read_text(encoding="utf-8", errors="replace")
+        changed = False
+        out_lines: list[str] = []
+        for line in text.splitlines():
+            m = re.match(r"^(\s*)nonRotatingPatches\s*\(\s*([^)]*)\s*\)\s*;?\s*$", line)
+            if not m:
+                out_lines.append(line)
+                continue
+            indent = m.group(1)
+            existing = m.group(2).split()
+            merged = sorted(set(existing) | set(extras))
+            out_lines.append(f"{indent}nonRotatingPatches ( {' '.join(merged)} );")
+            if merged != sorted(set(existing)):
+                changed = True
+        if changed:
+            mrf.write_text("\n".join(out_lines) + "\n", encoding="utf-8")
+            print(f"updated {mrf} (nonRotating += {len(extras)} patch(es))")
     return 0
 
 
@@ -95,10 +108,16 @@ def fix_case(case: Path) -> int:
         changed = False
         new_patches: list[PatchInfo] = []
         for p in patches:
-            if "_to_" not in p.name or (
+            # Never rewrite non-coupling patches (preserves cyclicAMI metadata).
+            if "_to_" not in p.name:
+                new_patches.append(p)
+                continue
+            if (
                 p.patch_type == "mappedWall"
                 and p.sample_region
                 and p.sample_region not in ("None", "none")
+                and p.sample_patch
+                and p.sample_patch not in ("None", "none")
             ):
                 new_patches.append(p)
                 continue
@@ -116,6 +135,11 @@ def fix_case(case: Path) -> int:
                     sample_mode="nearestPatchFace",
                     sample_region=remote,
                     sample_patch=f"{remote}_to_{local}",
+                    # Preserve AMI/other metadata if mis-tagged.
+                    neighbour_patch=p.neighbour_patch,
+                    rotation_axis=p.rotation_axis,
+                    match_tolerance=p.match_tolerance,
+                    transform=p.transform,
                 )
             )
             changed = True

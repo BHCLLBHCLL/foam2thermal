@@ -91,7 +91,22 @@ def _write_cell_to_region(out: Path, mesh, regions: list) -> None:
 
 
 def _ami_patterns(cfg: CaseConfig) -> list[str]:
-    return cfg.interfaces.get("ami_patterns", [r"ami_rot\d+"])
+    """AMI regex patterns plus exact names from explicit cyclicAMI pairs.
+
+    Exact names ensure the stationary AMI side (e.g.
+    ``_PartSurface_air_domain_7``) is matched even when it does not contain
+    ``rotation`` / ``ami_rot``.
+    """
+    import re
+
+    pats = list(cfg.interfaces.get("ami_patterns", [r"ami_rot\d+", r".*[Rr]otation\d*"]))
+    for e in cfg.interfaces.get("explicit", []):
+        if e.get("method") == "cyclicAMI":
+            for key in ("master", "slave"):
+                name = e.get(key)
+                if name:
+                    pats.append(re.escape(str(name)))
+    return pats
 
 
 def _mrf_non_rotating_patches(
@@ -99,19 +114,20 @@ def _mrf_non_rotating_patches(
     ami_patterns: list[str],
     rotating_zones: list[str],
 ) -> list[str]:
-    """Patches on the rotating cellZone that should NOT rotate.
+    """Patches that must stay inertial under MRF.
 
-    For a single MRF zone this is the set of AMI patches that belong to
-    *this* rotating zone plus any external boundary patches (open*).
-    Coupling patches (``*_to_*``) are added after split by the solver.
+    Includes both cyclicAMI sides, open* freestream patches, and any
+    ``*_to_*`` coupling already present.  Post-split ``air_to_*`` patches are
+    merged again by ``fix_mapped_wall_patches`` (after ``constant.orig`` copy).
     """
+    _ = rotating_zones  # reserved for per-zone filtering
     from .interfaces import is_ami_patch
 
     out: list[str] = []
     for p in patches:
         if is_ami_patch(p, ami_patterns):
             out.append(p)
-        elif p == "open" or (p.startswith("open") and p.endswith("_1")):
+        elif p == "open" or p.startswith("open"):
             out.append(p)
         elif "_to_" in p:
             out.append(p)
@@ -723,6 +739,8 @@ def _allrun_pre(cfg: CaseConfig, interfaces, mesh, ami_on_mesh: list[tuple[str, 
         "else",
         '    echo "FOAM2THERMAL_KEEP_SETTINGS=1: preserving existing system/constant settings"',
         "fi",
+        # Re-merge nonRotatingPatches after constant.orig overwrite (AMI + air_to_*).
+        '"$PYTHON" "${0%/*}/scripts/fix_mapped_wall_patches.py" "$(pwd)"',
         '"$PYTHON" "${0%/*}/scripts/sync_region_fields.py" "$(pwd)"',
         "set +e",
         "runApplication -s renumberMesh renumberMesh -allRegions -overwrite",

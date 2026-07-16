@@ -489,9 +489,24 @@ def _bc_block(name: str, spec: dict[str, Any], field: str) -> str:
             lines.append(f"        {key:<16} uniform ({' '.join(str(v) for v in val)});")
         else:
             lines.append(f"        {key:<16} uniform {val};")
-    if btype in ("fixedValue", "inletOutlet", "externalWallHeatFluxTemperature"):
+    if btype in (
+        "fixedValue",
+        "inletOutlet",
+        "externalWallHeatFluxTemperature",
+        "totalPressure",
+        "prghTotalPressure",
+    ):
         if "value" not in spec:
             lines.append("        value           $internalField;")
+    if btype in ("totalPressure", "prghTotalPressure") and "p0" not in spec:
+        lines.append("        p0              $internalField;")
+    if btype == "prghTotalPressure":
+        if "U" not in spec:
+            lines.append("        U               U;")
+        if "phi" not in spec:
+            lines.append("        phi             phi;")
+        if "rho" not in spec:
+            lines.append("        rho             rho;")
     lines.append("    }")
     return "\n".join(lines)
 
@@ -720,17 +735,21 @@ def field_p_rgh(
         elif is_ami_patch(p, ami_patterns):
             blocks.append(f"    {p}\n{_cyclic_ami_bc('p_rgh')}")
         elif p == "open":
-            # Inlet with fixed velocity -> fixedFluxPressure so the pressure
-            # floats and the mass flux is driven by the U boundary.
+            # Freestream on p_rgh must use prghTotalPressure (not totalPressure,
+            # which applies to static p and can wreck heRhoThermo / rho bounds).
             blocks.append(
                 f"""    {p}
     {{
-        type            fixedFluxPressure;
+        type            prghTotalPressure;
+        p0              uniform {p0};
+        U               U;
+        phi             phi;
+        rho             rho;
         value           $internalField;
     }}"""
             )
         elif p.endswith("_1") and p.startswith("open"):
-            # Outlet -> fixedValue pins the pressure reference (gauge = 0).
+            # Dedicated outlet -> fixedValue pins the static pressure.
             blocks.append(
                 f"""    {p}
     {{

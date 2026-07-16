@@ -162,21 +162,25 @@ def parse_boundary(path: Path) -> list[PatchInfo]:
     text = _skip_foam_header(path.read_text(encoding="utf-8", errors="replace"))
     patches: list[PatchInfo] = []
 
-    # cgns2foam / ANSA: startFace may appear before or after nFaces
+    # Full patch blocks: neighbourPatch / rotationAxis / sample* often come
+    # *after* nFaces/startFace in OpenFOAM-native boundaries.  Truncating at
+    # nFaces would drop those keys and rewrite cyclicAMI as neighbourPatch None.
     block_re = re.compile(
-        r"(\w[\w\.]*)\s*\{[^}]*?type\s+(\S+);[^}]*?"
-        r"(?:nFaces\s+(\d+);[^}]*?startFace\s+(\d+)|"
-        r"startFace\s+(\d+);[^}]*?nFaces\s+(\d+));",
+        r"(\w[\w\.]*)\s*\{(.*?)\}",
         flags=re.DOTALL,
     )
     for m in block_re.finditer(text):
-        if m.group(3) is not None:
-            n_faces, start_face = int(m.group(3)), int(m.group(4))
-        else:
-            start_face, n_faces = int(m.group(5)), int(m.group(6))
-        block_start = m.start()
-        block_end = m.end()
-        block = text[block_start:block_end]
+        name = m.group(1)
+        block = m.group(2)
+        tm = re.search(r"type\s+(\S+);", block)
+        if not tm:
+            continue
+        patch_type = tm.group(1)
+        nf = re.search(r"nFaces\s+(\d+);", block)
+        sf = re.search(r"startFace\s+(\d+);", block)
+        if not nf or not sf:
+            continue
+        n_faces, start_face = int(nf.group(1)), int(sf.group(1))
         neighbour = None
         nm = re.search(r"neighbourPatch\s+(\S+);", block)
         if nm:
@@ -205,8 +209,8 @@ def parse_boundary(path: Path) -> list[PatchInfo]:
             sample_patch = sp.group(1)
         patches.append(
             PatchInfo(
-                name=m.group(1),
-                patch_type=m.group(2),
+                name=name,
+                patch_type=patch_type,
                 n_faces=n_faces,
                 start_face=start_face,
                 sample_mode=sample_mode,
