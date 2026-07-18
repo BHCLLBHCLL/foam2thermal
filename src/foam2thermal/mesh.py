@@ -36,6 +36,20 @@ def parse_coupling_patch(name: str, region_names: list[str]) -> tuple[str, str] 
     return None
 
 
+def resolve_open_patch_type(name: str, fallback: str = "wall") -> str:
+    """Force ``open*`` boundaries to OpenFOAM type ``patch``.
+
+    cgns2foam often emits open boundaries as ``wall``; that is wrong for a free
+    opening and fights pressure/velocity BCs.  Specialised types (cyclicAMI,
+    mappedWall, …) are preserved.
+    """
+    if fallback not in ("wall", "patch"):
+        return fallback
+    if name == "open" or name.startswith("open"):
+        return "patch"
+    return fallback
+
+
 def mapped_wall_patch(
     local_region: str,
     remote_region: str,

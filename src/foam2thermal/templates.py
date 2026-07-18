@@ -307,6 +307,16 @@ def fv_options_limit_temperature_block(t_min: float, t_max: float) -> str:
 }}"""
 
 
+def fv_options_limit_velocity_block(u_max: float) -> str:
+    return f"""limitU
+{{
+    type            limitVelocity;
+    active          yes;
+    selectionMode   all;
+    max             {u_max};
+}}"""
+
+
 def fv_options_power_source(name: str, power_w: float) -> str:
     """Uniform absolute enthalpy source (W) over all cells in the region."""
     return f"""{name}
@@ -348,6 +358,11 @@ def build_region_fv_options(
             blocks["limitT"] = fv_options_limit_temperature_block(
                 lim.get("min", 200), lim.get("max", 500)
             )
+        u_lim = numerics.get("limitVelocity")
+        if u_lim is not None:
+            u_max = float(u_lim.get("max", u_lim) if isinstance(u_lim, dict) else u_lim)
+            if u_max > 0:
+                blocks["limitU"] = fv_options_limit_velocity_block(u_max)
     elif region_type == "solid":
         from .heat_sources import region_power_watts
 
@@ -625,9 +640,17 @@ def field_U(
             blocks.append(_bc_block(p, bc_cfg[p], "U"))
         elif is_ami_patch(p, ami_patterns):
             blocks.append(f"    {p}\n{_cyclic_ami_bc('U')}")
+        elif p == "open":
+            # Free opening (mesh type must be patch, not wall).
+            blocks.append(
+                f"""    {p}
+    {{
+        type            pressureInletOutletVelocity;
+        value           $internalField;
+    }}"""
+            )
         elif p.endswith("_1") and p.startswith("open"):
-            # Outlet -> pressureInletOutletVelocity lets flow leave freely and
-            # reverts to internalField on backflow.
+            # Dedicated outlet opening -> pressureInletOutletVelocity.
             blocks.append(
                 f"""    {p}
     {{
@@ -735,8 +758,8 @@ def field_p_rgh(
         elif is_ami_patch(p, ami_patterns):
             blocks.append(f"    {p}\n{_cyclic_ami_bc('p_rgh')}")
         elif p == "open":
-            # Freestream on p_rgh must use prghTotalPressure (not totalPressure,
-            # which applies to static p and can wreck heRhoThermo / rho bounds).
+            # Free opening on p_rgh: prghTotalPressure (not totalPressure on
+            # static p). Matches pressureInletOutletVelocity on U.
             blocks.append(
                 f"""    {p}
     {{
@@ -749,7 +772,7 @@ def field_p_rgh(
     }}"""
             )
         elif p.endswith("_1") and p.startswith("open"):
-            # Dedicated outlet -> fixedValue pins the static pressure.
+            # Dedicated outlet opening -> fixedValue pins static pressure.
             blocks.append(
                 f"""    {p}
     {{

@@ -165,4 +165,4 @@ Time=2 温度被 limitTemperature 裁剪到 [200, 500] K，求解器不再因热
 ## 8. 后续关联（v0.5）
 
 BCs_fix 算例默认**不做 coalesce**，开放单元问题更多依赖 mappedWall 耦合而非合并内部面。
-叶轮壁面已改为 `movingWallVelocity`（见 `docs/tech_bcs_fix_interfaces.md`），与本文焓发散修正独立、可叠加使用。
+叶轮壁面已改为 `movingWallVelocity`；`open` 须为网格类型 **`patch`**，`p_rgh` 推荐 **`prghTotalPressure`**（见 `docs/tech_bcs_fix_interfaces.md`）。与本文焓发散修正独立、可叠加使用。

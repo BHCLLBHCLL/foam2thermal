@@ -30,3 +30,10 @@ Non-obvious caveats for working in this repo:
   names matching the config's `regions[].cellZones`.
 - **No automated test suite and no linter/formatter are configured.** For a
   basic static check use `python3 -m py_compile setup_cht_case.py src/foam2thermal/*.py scripts/*.py`.
+- **`open*` must be mesh type `patch`** (cgns2foam often emits `wall`). Split /
+  `fix_mapped_wall_patches.py` force this; recommended fluid BC is
+  `pressureInletOutletVelocity` + `prghTotalPressure` (not static `totalPressure`
+  on `p_rgh`). See `README.md` and `docs/tech_bcs_fix_interfaces.md`.
+- **MRF `nonRotatingPatches`** must list both cyclicAMI sides, all `open*`, and
+  post-split `air_to_*`. `Allrun.pre` runs `fix_mapped_wall_patches.py` again
+  after copying `constant.orig` so the merge is not wiped.

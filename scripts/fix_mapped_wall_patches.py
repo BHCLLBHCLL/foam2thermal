@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
-"""Upgrade regional *_to_* polyMesh patches from wall to mappedWall."""
+"""Post-split mesh/BC hygiene for multi-region CHT cases.
+
+- Upgrade ``*_to_*`` polyMesh patches from ``wall`` to ``mappedWall``
+- Force ``open*`` patch type from ``wall`` → ``patch`` (free openings)
+- Merge AMI + open + coupling names into ``MRFProperties.nonRotatingPatches``
+  (also updates ``constant.orig/air`` so Allrun.pre ``cp`` cannot wipe it)
+"""
 
 from __future__ import annotations
 
@@ -24,6 +30,7 @@ from foam2thermal.mesh import (  # noqa: E402
     boundary_header_text,
     parse_boundary,
     parse_coupling_patch,
+    resolve_open_patch_type,
     write_boundary,
 )
 
@@ -103,11 +110,31 @@ def _update_mrf_non_rotating(case: Path, regions: list[str]) -> int:
 def fix_case(case: Path) -> int:
     regions = _region_names(case)
     n_fixed = 0
+    n_open = 0
     for bnd in case.glob("constant/*/polyMesh/boundary"):
         patches = parse_boundary(bnd)
         changed = False
         new_patches: list[PatchInfo] = []
         for p in patches:
+            # cgns2foam marks open* as wall; force type=patch (free opening).
+            resolved = resolve_open_patch_type(p.name, p.patch_type)
+            if resolved != p.patch_type:
+                p = PatchInfo(
+                    name=p.name,
+                    patch_type=resolved,
+                    n_faces=p.n_faces,
+                    start_face=p.start_face,
+                    sample_mode=p.sample_mode,
+                    sample_region=p.sample_region,
+                    sample_patch=p.sample_patch,
+                    neighbour_patch=p.neighbour_patch,
+                    rotation_axis=p.rotation_axis,
+                    match_tolerance=p.match_tolerance,
+                    transform=p.transform,
+                )
+                changed = True
+                n_open += 1
+
             # Never rewrite non-coupling patches (preserves cyclicAMI metadata).
             if "_to_" not in p.name:
                 new_patches.append(p)
@@ -135,7 +162,6 @@ def fix_case(case: Path) -> int:
                     sample_mode="nearestPatchFace",
                     sample_region=remote,
                     sample_patch=f"{remote}_to_{local}",
-                    # Preserve AMI/other metadata if mis-tagged.
                     neighbour_patch=p.neighbour_patch,
                     rotation_axis=p.rotation_axis,
                     match_tolerance=p.match_tolerance,
@@ -147,7 +173,7 @@ def fix_case(case: Path) -> int:
         if changed:
             write_boundary(bnd, new_patches, boundary_header_text(bnd))
             print(f"updated {bnd}")
-    print(f"fixed {n_fixed} coupling patch(es) in {case}")
+    print(f"fixed {n_fixed} coupling patch(es), {n_open} open->patch in {case}")
     _update_mrf_non_rotating(case, regions)
     return 0
 

@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""Upgrade regional AMI wall patches to cyclicAMI with coupling parameters."""
+"""Upgrade regional AMI wall patches to cyclicAMI with coupling parameters.
+
+Reads ``interfaces.explicit`` cyclicAMI pairs and ``ami_patterns`` from
+``config.json``.  Also repairs cyclicAMI patches that already have the type but
+a missing/wrong ``neighbourPatch`` (e.g. after a truncated boundary rewrite).
+"""
 
 from __future__ import annotations
 

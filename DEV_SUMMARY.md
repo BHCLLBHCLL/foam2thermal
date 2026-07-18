@@ -211,20 +211,31 @@ air_to_CPU
 
 ## 4. 边界条件配置
 
-### 4.1 p_rgh 边界条件（关键修复）
+### 4.1 `open` 网格类型与 p_rgh（关键修复）
 
-**问题**：`open` 补丁使用 `fixedFluxPressure` 时，`adjustPhi` 不将其视为可调节出口，
-导致 "Continuity error cannot be removed by adjusting the outflow" 错误。
+**问题 A**：cgns2foam 常把 `open*` 标成 `wall`。自由开口必须是 **`patch`**，否则与压力/速度开口 BC 冲突。
 
-**修复**：将 `open` 补丁的 p_rgh 改为 `fixedValue`：
+**修复 A**：`mesh.resolve_open_patch_type`；`mesh_split` 写区域 boundary 时调用；`fix_mapped_wall_patches.py` 后处理强制 `open*` → `patch`。
+
+**问题 B**：`open` 上 `p_rgh` 用 `fixedFluxPressure` 时，`adjustPhi` 不认作可调出口；用静态场的 `totalPressure` 会破坏 `heRhoThermo`。纯 `fixedValue` 在大包围盒上易产生角点数百 m/s 射流。
+
+**修复 B**（推荐，BCs_fix / v3 配置）：
 
 ```json
+"U": {
+  "open": { "type": "pressureInletOutletVelocity", "value": "uniform (0 0 0)" }
+},
 "p_rgh": {
-    "open": { "type": "fixedValue", "value": "uniform 0" }
+  "open": {
+    "type": "prghTotalPressure",
+    "p0": "uniform 101325",
+    "U": "U", "phi": "phi", "rho": "rho",
+    "value": "uniform 101325"
+  }
 }
 ```
 
-`fixedValue` 使 `pPatch.fixesValue()` 返回 true，被 `adjustPhi` 识别为可调节出口。
+可选 `numerics.limitVelocity.max`（如 `4`）压制箱角尖峰。叶尖量级约 `ωR`（`omega=100 rad/s`，`R≈0.03 m` → ~3 m/s）。
 
 ### 4.2 场同步 (field_sync.py)
 
@@ -260,6 +271,23 @@ value           uniform (0 0 0);
 ```
 
 壁面绝对速度由 MRF 按 ω×r 给出。配置中应将叶轮列入 `interfaces.exclude`，避免被当成耦合界面。
+
+### 4.5 `parse_boundary` 完整块解析（关键修复）
+
+**问题**：旧正则在 `nFaces`/`startFace` 处截断，其后的 `neighbourPatch` / `rotationAxis` / `sampleRegion` 读不到；`fix_*` 重写 boundary 时会把 cyclicAMI 写成 `neighbourPatch None` → `decomposePar` FATAL。
+
+**修复**：按完整 `{...}` 块解析（`mesh.parse_boundary`）。
+
+### 4.6 MRF `nonRotatingPatches` 完整性（关键修复）
+
+**问题**：build 时 AMI 模式漏掉不含 `rotation` 的一侧；`fix_mapped_wall` 合并 `air_to_*` 后又被 `cp constant.orig → constant` 覆盖。
+
+**修复**：
+
+- `_ami_patterns` 并入 explicit cyclicAMI 精确名
+- `nonRotatingPatches` 含 AMI 两侧 + 全部 `open*` + `*_to_*`
+- `Allrun.pre` 在部署 `constant.orig` **之后**再跑一次 `fix_mapped_wall_patches.py`
+- 脚本同时更新 `constant.orig/air/MRFProperties`
 
 ---
 
@@ -305,22 +333,19 @@ MRF1
 {
     cellZone            FPHPARTS.rotation1;
     active              yes;
-    nonRotatingPatches  ( ami_rot1 ami_rot1_1 ami_rot2 ami_rot2_1 open open_1 );
-    origin              (-67.8 -2.999 80.986);
+    nonRotatingPatches  ( _PartSurface_air_domain_7 _PartSurface_air_domain_8
+                          _PartSurface_rotation1 _PartSurface_rotation2
+                          air_to_CPU air_to_Cover ... open );
+    origin              (...);
     axis                (0 1 0);
     omega               100.0;
 }
-
-MRF2
-{
-    cellZone            FPHPARTS.rotation2;
-    ...
-    axis                (0 -1 0);
 ```
 
-- `nonRotatingPatches` 必须包含所有 AMI 面和开放边界
-- 默认转轴：`rotation1` → `(0 1 0)`，`rotation2` → `(0 -1 0)`；其他 cellZone 回退 `(0 0 1)`
+- `nonRotatingPatches` 必须包含：**AMI 两侧**、全部 `open*`、以及 split 后 `air_to_*`（叶轮叶片 **不要**列入）
+- BCs_fix 双风扇默认转轴均为 `(0 1 0)`（与 `ami_rotation_axis` 一致）；旧启发式曾对 `rotation2` 用 `-Y`
 - `origin` 默认按各 rotation cellZone 几何中心分别计算
+- prep 在 `cp constant.orig → constant` **之后**再次合并 nonRotating，避免覆盖
 
 ### 6.2 Allrun.pre 复制问题（Windows）
 
@@ -381,17 +406,18 @@ chtMultiRegionSimpleFoam.exe > log.chtMultiRegionSimpleFoam 2>&1
 | 文件 | 职责 |
 |------|------|
 | `src/foam2thermal/mesh_coalesce.py` | 可选网格合并、点合并、几何兜底配对 |
-| `src/foam2thermal/mesh_split.py` | 区域分裂、mappedWall；跳过 AMI/rotation |
-| `src/foam2thermal/mesh.py` | 网格读写、boundary/cellZones、`regionProperties`、拓扑 patch→region |
-| `src/foam2thermal/case_generator.py` | 案例生成；扫描结果写入 `config.json` |
-| `src/foam2thermal/templates.py` | OpenFOAM 字典模板；impeller → `movingWallVelocity` |
+| `src/foam2thermal/mesh_split.py` | 区域分裂、mappedWall；跳过 AMI/rotation；`open`→`patch` |
+| `src/foam2thermal/mesh.py` | 网格读写、完整 `parse_boundary`、`resolve_open_patch_type`、拓扑 patch→region |
+| `src/foam2thermal/case_generator.py` | 案例生成；AMI 精确名；Allrun.pre 二次 fix_mapped |
+| `src/foam2thermal/templates.py` | 模板；impeller → `movingWallVelocity`；open → `prghTotalPressure`；`limitVelocity` |
 | `src/foam2thermal/field_sync.py` | 分裂后场同步；effective AMI 精确名模式 |
 | `src/foam2thermal/config.py` | 配置加载与校验 |
 | `src/foam2thermal/interfaces.py` | 等面数/后缀扫描、AMI 识别、流/固分类 |
 | `src/foam2thermal/runner.py` | MSYS2 调用 OpenFOAM（prep / solve） |
 | `scripts/fix_cyclic_ami_patches.py` | 按配置升级 cyclicAMI |
-| `configs/laptop_thermal_steady_v3_BCs_fix.json` | **推荐** BCs_fix 配置（无 coalesce/stitch） |
-| `configs/laptop_thermal_steady_v3.json` | v3 经典后缀命名配置 |
+| `scripts/fix_mapped_wall_patches.py` | mappedWall + open→patch + MRF nonRotating |
+| `configs/laptop_thermal_steady_v3_BCs_fix.json` | **推荐** BCs_fix（`prghTotalPressure` / `limitVelocity`） |
+| `configs/laptop_thermal_steady_v3.json` | v3 经典后缀命名（`open` BC 已对齐） |
 | `docs/tech_bcs_fix_interfaces.md` | BCs_fix 界面与叶轮专题 |
 | `docs/tech_h_initial_divergence_fix.md` | 焓值 h 初始发散修正 |
 
@@ -543,6 +569,10 @@ chtMultiRegionSimpleFoam.exe > log.chtMultiRegionSimpleFoam 2>&1
 | BCs_fix 界面 stem 不同无法配对 | 等面数 + 名称↔region token 打分（v0.5） |
 | AMI 仅识别 `ami_rot*` | 扩展 `rotation*` / `_looks_like_rotation` + explicit 精确名 |
 | 叶轮 `noSlip` 虚假射流 | `impeller*` → `movingWallVelocity` |
+| `open` 误标为 `wall` | `resolve_open_patch_type` → `patch` |
+| `open` 出口数百 m/s 射流 | `prghTotalPressure` + AMI/MRF nonRotating 补全；可选 `limitVelocity` |
+| `parse_boundary` 截断丢 AMI 元数据 | 完整 `{...}` 块解析 |
+| MRF nonRotating 被 `constant.orig` 覆盖 | Allrun.pre 二次 `fix_mapped_wall`；写两侧 MRF |
 
 ### 仍待解决
 
@@ -647,10 +677,10 @@ CGNS ──► scan 配对/分类 ──► build 模板+config ──► prep(s
 | # | 问题 | 证据 / 影响 |
 |---|------|-------------|
 | 10 | 强绑定 laptop 命名 | `_infer_patch_region`、`open`/`impeller` 特判；换项目需改代码或大量 JSON |
-| 11 | `parse_boundary` 不完整 | 正则止于 `nFaces/startFace`；其后的 `sampleRegion`/`samplePatch` 可能读不到 |
-| 12 | Windows prep 脆弱 | `Allrun.pre` 仍 `cp -f`；`createPatch`/`checkMesh` 非致命，依赖 Python 补丁 |
-| 13 | 无自动化测试 | 配对、split、AMI sync、叶轮 BC 无回归护栏 |
-| 14 | 文档滞后 | AMI `transform` 文档曾写 `rotational`、代码为 `noOrdering`；README 混用 `python`/`python3` |
+| 11 | `parse_boundary` | ✅ 已改为完整块解析；旧文档描述已过时 |
+| 12 | Windows prep 脆弱 | `Allrun.pre` 仍 `cp -f`；`createPatch`/`checkMesh` 非致命，依赖 Python 补丁；磁盘满时 `decomposePar` IO ERROR |
+| 13 | 无自动化测试 | 配对、split、AMI sync、叶轮/`open` BC 无回归护栏 |
+| 14 | 文档滞后 | 持续同步 README / 本文件 / `docs/tech_bcs_fix_interfaces.md` |
 | 15 | 其它气味 | `_build_patch_pairs` 类型标注与三元组不符；`fix_mapped_wall` 写死 `air/MRFProperties`；`omega` 无单位校验；`p_rgh` build 写 0、sync 写绝对压 |
 
 ### 13.6 严重度速查
@@ -659,7 +689,7 @@ CGNS ──► scan 配对/分类 ──► build 模板+config ──► prep(s
 |------|------|
 | **Critical** | split 耦合面因 remote 名丢弃；scan/build 区域类型源不一致 |
 | **High** | 等面数漏耦 + coalesce 关；`interface_neighbors` 空；coalesce 默认 True；AMI/MRF 轴；数值分叉；叶轮 BC 可被覆盖 |
-| **Medium** | 假配对；`classify` 对 AMI 名强制 cyclicAMI；`parse_boundary`；omega 无校验；limitT 仅流体 |
+| **Medium** | 假配对；`classify` 对 AMI 名强制 cyclicAMI；omega 无校验；limitT 仅流体；小外盒压力开口远场 ~1 m/s 穿流（物理/域尺寸权衡） |
 | **Low** | laptop 启发式；类型标注；MRF 写死 air；无测试；文档不一致 |
 
 ### 13.7 优先改进建议

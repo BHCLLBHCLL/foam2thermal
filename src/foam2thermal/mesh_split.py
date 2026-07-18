@@ -15,6 +15,7 @@ from .mesh import (
     mapped_wall_patch,
     parse_boundary,
     parse_cell_zones,
+    resolve_open_patch_type,
     write_boundary,
     write_cell_zones_v2412,
 )
@@ -405,7 +406,7 @@ def _extract_region_mesh(
         final_patches.append(
             PatchInfo(
                 name=p.name,
-                patch_type=p.patch_type,
+                patch_type=resolve_open_patch_type(p.name, p.patch_type),
                 n_faces=sel.size,
                 start_face=cursor,
                 sample_mode=p.sample_mode,

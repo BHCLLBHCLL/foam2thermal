@@ -289,6 +289,9 @@
       "min": 200,
       "max": 500
     },
+    "limitVelocity": {
+      "max": 4
+    },
     "relaxation": {
       "p_rgh": 0.2,
       "U": 0.2,

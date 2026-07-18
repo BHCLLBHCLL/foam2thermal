@@ -509,19 +509,10 @@ def _write_binary_label_list(path: Path, values: np.ndarray, header: bytes) -> N
 
 
 def _resolve_patch_type(name: str, fallback: str = "wall") -> str:
-    """Return the correct OpenFOAM patch type for *name*.
+    """Compatibility wrapper – prefer ``mesh.resolve_open_patch_type``."""
+    from .mesh import resolve_open_patch_type
 
-    cgns2foam often emits open boundaries (``open``, ``open_1`` …) as
-    ``wall``; keeping that type makes OpenFOAM impose wall constraints on
-    what should be a free boundary, which breaks mass conservation.  Open
-    boundaries must be typed ``patch``.  Specialised types (cyclicAMI,
-    mappedWall, …) are always preserved.
-    """
-    if fallback not in ("wall", "patch"):
-        return fallback
-    if name == "open" or name.startswith("open"):
-        return "patch"
-    return fallback
+    return resolve_open_patch_type(name, fallback)
 
 
 def _compact_mesh(

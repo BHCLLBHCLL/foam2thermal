@@ -182,7 +182,14 @@
         "open": { "type": "pressureInletOutletVelocity", "value": "uniform (0 0 0)" }
       },
       "p_rgh": {
-        "open": { "type": "fixedValue", "value": "uniform 101325" }
+        "open": {
+          "type": "prghTotalPressure",
+          "p0": "uniform 101325",
+          "U": "U",
+          "phi": "phi",
+          "rho": "rho",
+          "value": "uniform 101325"
+        }
       }
     },
     "CPU": {
@@ -225,6 +232,9 @@
     "limitTemperature": {
       "min": 200,
       "max": 2000
+    },
+    "limitVelocity": {
+      "max": 4
     },
     "relaxation": {
       "p_rgh": 0.3,
